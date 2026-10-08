@@ -1,0 +1,30 @@
+# Compiled binaries
+*.o
+*.out
+*.exe
+
+# Build directories
+build/
+bin/
+
+# Debugging
+*.log
+core
+core.*
+
+# Checkpoint / runtime data
+checkpoints/
+runtime/
+*.checkpoint
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
