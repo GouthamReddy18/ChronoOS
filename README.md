@@ -46,6 +46,31 @@ ChronoOS focuses on the following Operating Systems concepts:
 - Process Recovery
 - Checkpointing and Rollback
 
+## Phase 1: CLI and process inspection
+
+Phase 1 provides a small C CLI that reads metadata for an explicitly selected
+process through `/proc`, plus a counter workload for later checkpoint/restore
+experiments. It does not stop processes or invoke CRIU.
+
+Build with `make`. The binaries are written under `build/`:
+
+Run the Phase 1 regression suite with `make test`. It builds the programs and
+checks process inspection, PID argument validation, UID parsing, and counter
+shutdown on SIGINT and SIGTERM.
+
+```sh
+./build/chrono inspect PID
+./build/counter_workload [interval-seconds]
+```
+
+The inspection command rejects PID 1, itself, and processes owned by another
+user (unless run with effective UID 0). Run the counter workload as your own
+user; it prints an incrementing counter and exits cleanly on SIGINT or SIGTERM.
+
+CRIU checkpointing and restoration are planned for a later phase. Restoring a
+process does not reverse external effects such as completed file writes,
+database changes, or network requests.
+
 ## Planned Architecture
 
 ```text
