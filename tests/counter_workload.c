@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -17,11 +18,11 @@ static void handle_signal(int signal_number)
 int main(int argc, char **argv)
 {
     long interval = 1;
-    if (argc > 2) {
-        fprintf(stderr, "Usage: %s [interval-seconds 1..60]\n", argv[0]);
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [interval-seconds 1..60 [identity-token]]\n", argv[0]);
         return 2;
     }
-    if (argc == 2) {
+    if (argc >= 2) {
         char *end = NULL;
         errno = 0;
         interval = strtol(argv[1], &end, 10);
@@ -29,6 +30,12 @@ int main(int argc, char **argv)
             fprintf(stderr, "counter_workload: interval must be an integer from 1 to 60\n");
             return 2;
         }
+    }
+    if (argc == 3) {
+        if (strlen(argv[2]) != 32) return 2;
+        for (size_t i = 0; i < 32; ++i)
+            if (!((argv[2][i] >= '0' && argv[2][i] <= '9') ||
+                  (argv[2][i] >= 'a' && argv[2][i] <= 'f'))) return 2;
     }
 
     struct sigaction action = {0};

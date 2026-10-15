@@ -23,11 +23,14 @@ $(COUNTER): tests/counter_workload.c | $(BUILD_DIR)
 $(BUILD_DIR)/test_process: tests/test_process.c src/process.c src/process_internal.h include/chrono/process.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_process.c src/process.c
 
-test: all $(BUILD_DIR)/test_process
+$(BUILD_DIR)/registry_fixture: tests/registry_fixture.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+test: all $(BUILD_DIR)/test_process $(BUILD_DIR)/registry_fixture
 	sh tests/test_phase1.sh
 
 clean:
-	rm -f $(CHRONO) $(COUNTER)
+	rm -f $(CHRONO) $(COUNTER) $(BUILD_DIR)/test_process $(BUILD_DIR)/registry_fixture
 
 help:
-	@printf '%s\n' 'Targets:' '  all    Build chrono and counter_workload' '  test   Build and run Phase 1 regression tests' '  clean  Remove generated build binaries' '  help   Show this help'
+	@printf '%s\n' 'Targets:' '  all    Build chrono and counter_workload' '  test   Build and run Phase 1 and Phase 2 lifecycle tests' '  clean  Remove generated build binaries' '  help   Show this help'
