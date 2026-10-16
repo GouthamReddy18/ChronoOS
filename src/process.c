@@ -529,3 +529,27 @@ int chrono_managed_stop(pid_t pid, uint64_t start_time, char *error, unsigned lo
     set_error(error, size, "pidfd unavailable; refusing race-prone signal"); return -1;
 #endif
 }
+
+int chrono_managed_pin(pid_t pid, uint64_t start_time, char *error, unsigned long size)
+{
+#ifdef SYS_pidfd_open
+    if (pid <= 1 || start_time == 0) {
+        set_error(error, size, "invalid managed process identity");
+        return -1;
+    }
+    int fd = (int)syscall(SYS_pidfd_open, pid, 0);
+    if (fd < 0) {
+        set_error(error, size, "pidfd unavailable; cannot pin managed process identity");
+        return -1;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || verify_managed(pid, start_time, fd, error, size) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+#else
+    (void)pid; (void)start_time;
+    set_error(error, size, "pidfd unavailable; cannot pin managed process identity");
+    return -1;
+#endif
+}

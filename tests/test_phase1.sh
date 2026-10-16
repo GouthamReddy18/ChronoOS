@@ -155,6 +155,21 @@ expect_status 2 "$CHRONO" inspect 999999999999999999999999
 expect_status 1 "$CHRONO" inspect 1
 expect_status 1 "$CHRONO" inspect 2147483647
 expect_status 2 "$CHRONO" inspect 12 extra
+fake_criu_log=./build/test-fake-criu.log
+: >"$fake_criu_log"
+expect_status 1 env CHRONO_CRIU_PATH=./build/fake_criu CHRONO_FAKE_CRIU_LOG="$fake_criu_log" "$CHRONO" checkpoint 1 1 review
+[ ! -s "$fake_criu_log" ]
+grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
+expect_status 1 "$CHRONO" checkpoint 1 1 review
+grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
+expect_status 1 "$CHRONO" restore review
+grep -Fxq 'chrono: cannot read checkpoint metadata' ./build/test-output.log
+expect_status 2 "$CHRONO" checkpoint 1 1
+expect_status 2 "$CHRONO" restore
+expect_status 2 "$CHRONO" checkpoint nope 1 review
+expect_status 2 "$CHRONO" checkpoint 1 0 review
+expect_status 2 "$CHRONO" checkpoint 1 1 ../review
+expect_status 2 "$CHRONO" restore ../review
 
 : >"$LOG"
 "$COUNTER" 60 >"$LOG" 2>&1 &

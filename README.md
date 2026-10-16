@@ -1,12 +1,13 @@
 # ChronoOS
 
-A lightweight Linux process checkpoint and rollback system.
+A lightweight Linux process checkpoint management layer built on CRIU.
 
 ## Overview
 
-ChronoOS is an Operating Systems project focused on developing a lightweight
-mechanism for checkpointing the state of a running process and restoring the
-process to a previously saved checkpoint.
+ChronoOS is an Operating Systems project that manages selected Linux process
+checkpoints through CRIU. ChronoOS validates managed process identities and
+checkpoint metadata, then delegates process capture and restoration to CRIU;
+it does not implement an independent checkpoint engine or bpfCP.
 
 The project explores practical Linux operating-system concepts including
 process management, process state, memory management, system calls, signals,
@@ -67,9 +68,8 @@ The inspection command rejects PID 1, itself, and processes owned by another
 user (unless run with effective UID 0). Run the counter workload as your own
 user; it prints an incrementing counter and exits cleanly on SIGINT or SIGTERM.
 
-CRIU checkpointing and restoration are planned for a later phase. Restoring a
-process does not reverse external effects such as completed file writes,
-database changes, or network requests.
+Restoring a process does not reverse external effects such as completed file
+writes, database changes, or network requests.
 
 ## Phase 2: controlled counter lifecycle
 
@@ -114,25 +114,118 @@ subreaper. That adopter is responsible for reaping it when it exits; ChronoOS
 cannot collect its exit status after detaching. While the launching CLI is
 alive, it performs a nonblocking wait if the child already exited. There is no
 supervisor or persistent wait-status service in this phase. The start-time
-identity, separate session, and retained process state provide a basis for
-future CRIU integration; this phase does not dump or restore processes.
+identity, separate session, and retained process state provide the basis for
+the Phase 3B CRIU adapter; Phase 2 alone does not dump or restore processes.
 
 Run `make test` for process inspection and controlled lifecycle coverage.
+
+## Phase 3A: checkpoint metadata
+
+Phase 3A adds private per-user metadata records with validated IDs, original
+PID and `/proc` start-time identity, creation time, workload/executable fields,
+backend name, and `PREPARING`, `COMPLETE`, or `FAILED` lifecycle states. Only
+`COMPLETE` records appear in `chrono checkpoints`. Metadata files are written
+with mode 0600 in a mode-0700 directory under `/tmp`; updates use a temporary
+file and atomic rename. The directory is checked for ownership and permissions
+and files are opened relative to its directory descriptor without following
+symlinks. Listing is read-only; if the directory does not exist, it succeeds
+with an empty result. A reported write error after publication can leave the
+new metadata visible while directory durability remains uncertain.
+
+The CHRONO1 metadata format is retained in Phase 3B. This metadata layer alone
+does not capture process state. The artifact directory is derived from the
+validated checkpoint ID as `CHECKPOINT_DIRECTORY/ID`.
+
+Transitions out of `PREPARING` are serialized with a directory-local lock, so
+among callers using the same directory at most one can successfully make the
+transition; the lock relies on local filesystem `flock` semantics and does not
+coordinate independent copies of the metadata directory. `COMPLETE` describes
+the metadata transition; the CLI reports artifact validity separately and
+validates CRIU inventory and file ownership/modes before restore.
+
+## Phase 3B: optional CRIU backend
+
+The CRIU adapter executes the CRIU binary directly with an argument vector; it
+does not use a shell. Set `CHRONO_CRIU_PATH` when CRIU is not at the documented
+fallback path `/usr/sbin/criu`. Before each operation ChronoOS runs
+`criu check --unprivileged` and fails closed when that capability and feature
+check does not pass. ChronoOS does not install CRIU or change system
+capabilities. CRIU needs access to the target's `/proc` information and uses
+ptrace while collecting process state. Kernel support such as
+`CONFIG_CHECKPOINT_RESTORE` and, depending on the process and operation,
+capabilities such as `CAP_CHECKPOINT_RESTORE` may be required. The exact access
+requirements depend on the target resources and security policy; a passing
+basic CRIU check does not guarantee every workload can be dumped or restored.
+See the [CRIU kernel check guide](https://criu.org/CLI/cmd/check), [kernel
+requirements](https://criu.org/Linux_kernel), and [checkpoint/restore
+design](https://criu.org/Checkpoint/Restore).
+
+`chrono checkpoint PID STARTTIME ID` requires the managed PID/start-time pair
+to pass the Phase 2 registry, executable, token, and process checks. It creates
+an exclusive private artifact directory, invokes CRIU dump for the process
+tree, validates `inventory.img` and artifact ownership/modes, and only then
+transitions metadata to `COMPLETE`. Failed or partial directories are retained
+for inspection and never treated as usable. Existing IDs and artifact
+directories are not overwritten.
+
+The CLI retains the pidfd and repeats the registry, PID start-time, executable,
+owner, and token checks immediately before dispatch. CRIU receives a numeric
+PID rather than the pidfd and runs its capability check before dumping, so a
+small race remains between validation and CRIU opening the target. The current
+CRIU interface cannot make that operation atomic with the pinned pidfd; the
+identity checks reduce the window but do not eliminate it.
+
+`chrono checkpoints` prints metadata state separately from `ARTIFACT=valid` or
+`ARTIFACT=missing-or-invalid`. The supported workload is the bundled detached
+`counter_workload` process tree. Artifact validation requires a private
+owner-controlled directory and a flat set of nonempty regular `.img` files
+including `inventory.img` plus at least one payload image; it rejects links, special files, unsafe ownership
+or permissions, and unexpected entries. These checks establish filesystem
+layout and basic presence only. ChronoOS does not decode CRIU's
+version-dependent inventory or prove cross-image consistency, completeness,
+or restorability. The accepted flat image-directory layout follows the
+`--images-dir` interface but has not been verified against a real CRIU run;
+the adapter tests use a fake executable and do not establish CRIU format
+compatibility. A failed dump can leave structurally plausible partial
+images, so it remains `FAILED` and is not eligible for restore; those files are
+retained as diagnostic evidence. Completed metadata alone does not establish that CRIU files
+exist or can be restored. Restore requires a completed record and structurally
+secure artifacts. A private one-time marker prevents repeated restore
+attempts. If CRIU reports success but the PID file is absent or invalid,
+ChronoOS reports that restoration may have occurred and does not retry. The
+restored PID is reported from CRIU's PID file; restore normally
+uses a new PID and does not replace the original Phase 2 registry entry. A
+successful CRIU dump normally terminates the original process.
+
+The managed counter is detached into its own session, while CRIU operates on
+process trees. Restore may depend on namespace, kernel feature, capability,
+security policy, file, socket, mount, and network support for the captured
+tree. A successful dump does not prove that restore will work. Use an authorized
+disposable Linux environment with suitable Linux capabilities, CRIU
+permissions, and kernel support
+for end-to-end experiments. Build with `make` and run `make test`, then set
+`CHRONO_CRIU_PATH` and use a managed counter:
+
+```sh
+export CHRONO_CRIU_PATH="$HOME/criu-source/criu/criu"
+./build/chrono launch counter 1
+./build/chrono checkpoint PID STARTTIME trial-1
+./build/chrono checkpoints
+./build/chrono restore trial-1
+```
+
+Replace `PID` and `STARTTIME` with the values printed by `launch`. Observe
+CRIU's diagnostics and both PIDs. Restore is attempted once per checkpoint ID.
+
+The fake executable in `make test` covers command execution, failure handling,
+availability checks, artifacts, and PID reporting. It does not establish that
+real checkpoint or restore works. On the specified institute machine CRIU's
+unprivileged check currently fails because the user lacks effective
+capabilities. Do not change shared machine security configuration to work
+around that limit.
 
 ## Planned Architecture
 
 ```text
-                    ChronoOS
-                       |
-              +--------+--------+
-              |                 |
-        Checkpoint Module   Recovery Module
-              |                 |
-        Capture Process     Restore Process
-             State              State
-              |                 |
-              +--------+--------+
-                       |
-                Checkpoint Data
-                       |
-                 Linux File System
+CLI → managed process identity validation → metadata and artifact validation
+→ CRIU adapter → CRIU dump/restore → Linux process and image files
