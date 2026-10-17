@@ -66,7 +66,14 @@ cleanup_managed() {
     [ "$cleanup_done" -eq 0 ] || return 0
     cleanup_done=1
     registry_ready=1
-    if [ "$registry_mode_changed" -eq 1 ]; then
+    registry_cleanup_needed=0
+    if [ "$registry_mode_changed" -eq 1 ] || [ "$fixture_created" -eq 1 ] ||
+       [ -n "${permission_pid:-}" ] || [ -n "${managed_pid:-}" ] ||
+       [ -n "${path_pid:-}" ] || [ -n "${link_pid:-}" ] ||
+       [ -n "${repeated_pid:-}" ]; then
+        registry_cleanup_needed=1
+    fi
+    if [ "$registry_cleanup_needed" -eq 1 ] && [ "$registry_mode_changed" -eq 1 ]; then
         restored=0
         attempt=0
         while [ "$attempt" -lt 3 ]; do
@@ -86,9 +93,9 @@ cleanup_managed() {
         if [ "$restored" -ne 1 ]; then
             registry_ready=0
         fi
-    elif [ ! -d "$registry_dir" ] || [ -L "$registry_dir" ] ||
+    elif [ "$registry_cleanup_needed" -eq 1 ] && { [ ! -d "$registry_dir" ] || [ -L "$registry_dir" ] ||
          [ "$(stat -c %u "$registry_dir" 2>/dev/null || true)" != "$(id -u)" ] ||
-         [ "$(stat -c %a "$registry_dir" 2>/dev/null || true)" != 700 ]; then
+         [ "$(stat -c %a "$registry_dir" 2>/dev/null || true)" != 700 ]; }; then
         registry_ready=0
     fi
     if [ "$registry_ready" -eq 1 ]; then
@@ -163,7 +170,7 @@ grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
 expect_status 1 "$CHRONO" checkpoint 1 1 review
 grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
 expect_status 1 "$CHRONO" restore review
-grep -Fxq 'chrono: cannot read checkpoint metadata' ./build/test-output.log
+grep -Fxq 'chrono: cannot open checkpoint metadata' ./build/test-output.log
 expect_status 2 "$CHRONO" checkpoint 1 1
 expect_status 2 "$CHRONO" restore
 expect_status 2 "$CHRONO" checkpoint nope 1 review
