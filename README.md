@@ -147,9 +147,11 @@ validates CRIU inventory and file ownership/modes before restore.
 
 The CRIU adapter executes the CRIU binary directly with an argument vector; it
 does not use a shell. Set `CHRONO_CRIU_PATH` when CRIU is not at the documented
-fallback path `/usr/sbin/criu`. Before each operation ChronoOS runs
-`criu check --unprivileged` and fails closed when that capability and feature
-check does not pass. ChronoOS does not install CRIU or change system
+fallback path `/usr/sbin/criu`. Before each operation ChronoOS runs plain
+`criu check` and fails closed when the required kernel feature check does not
+pass. This checks CRIU's required kernel features in the current execution
+context; it does not guarantee that a particular process can be dumped or
+restored. ChronoOS does not install CRIU or change system
 capabilities. CRIU needs access to the target's `/proc` information and uses
 ptrace while collecting process state. Kernel support such as
 `CONFIG_CHECKPOINT_RESTORE` and, depending on the process and operation,
@@ -218,10 +220,11 @@ Replace `PID` and `STARTTIME` with the values printed by `launch`. Observe
 CRIU's diagnostics and both PIDs. Restore is attempted once per checkpoint ID.
 
 The fake executable in `make test` covers command execution, failure handling,
-availability checks, artifacts, and PID reporting. It does not establish that
-real checkpoint or restore works. On the specified institute machine CRIU's
-unprivileged check currently fails because the user lacks effective
-capabilities. Do not change shared machine security configuration to work
+availability checks, artifacts, and PID reporting. Passing these fake-CRIU
+tests does not establish that real checkpoint or restore works. Real
+CRIU checkpoint and restore remain unvalidated. On the specified institute
+machine the CRIU kernel-feature check has failed under the available user
+permissions. Do not change shared machine security configuration to work
 around that limit.
 
 ## Planned Architecture

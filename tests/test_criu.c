@@ -86,10 +86,12 @@ int main(int argc,char **argv)
     strcpy(m.id,"check-failure");
     m.state=CHRONO_CHECKPOINT_PREPARING;
     (void)setenv("CHRONO_FAKE_CRIU_FAIL","check",1);
-    if(chrono_criu_checkpoint(&m,base,error,sizeof(error))==0) { remove_tree(base); return fail("failed check allowed dump"); }
+    if(chrono_criu_checkpoint(&m,base,error,sizeof(error))==0 ||
+       strstr(error,"kernel feature check failed (exit status 1)")==NULL) { remove_tree(base); return fail("failed check allowed dump or lost its diagnostic"); }
     (void)snprintf(artifact,sizeof(artifact),"%s/%s",base,m.id);
     if(access(artifact,F_OK)==0) { remove_tree(base); return fail("capability failure created artifact directory"); }
-    if(chrono_criu_available(error,sizeof(error))) { remove_tree(base); return fail("failed capability check reported available"); }
+    if(chrono_criu_available(error,sizeof(error)) ||
+       strstr(error,"kernel feature check failed (exit status 1)")==NULL) { remove_tree(base); return fail("failed capability check reported available or lost its diagnostic"); }
     (void)unsetenv("CHRONO_FAKE_CRIU_FAIL");
     strcpy(m.id,"restore-missing");
     m.state=CHRONO_CHECKPOINT_PREPARING;

@@ -17,7 +17,10 @@ int main(int argc, char **argv)
     }
     const char *fail = getenv("CHRONO_FAKE_CRIU_FAIL");
     if (argc < 2) return 90;
-    if (strcmp(argv[1], "check") == 0) return fail != NULL && strcmp(fail,"check")==0 ? 1 : 0;
+    if (strcmp(argv[1], "check") == 0) {
+        if (argc != 2) return 96;
+        return fail != NULL && strcmp(fail,"check")==0 ? 1 : 0;
+    }
     if (fail != NULL && strcmp(fail,argv[1])==0 &&
         !(strcmp(argv[1], "dump") == 0 && getenv("CHRONO_FAKE_CRIU_PARTIAL") != NULL)) return 7;
     const char *dir = NULL, *pidfile = NULL;

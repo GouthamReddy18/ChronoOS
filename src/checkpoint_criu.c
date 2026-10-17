@@ -60,18 +60,15 @@ static int run_criu(const char *operation, const char *path, char *const args[],
 
 static int check_criu(const char *path, char *error, size_t size)
 {
-    char *args[] = {(char *)path, "check", "--unprivileged", NULL};
-    return run_criu("capability check", path, args, error, size);
+    char *args[] = {(char *)path, "check", NULL};
+    return run_criu("kernel feature check", path, args, error, size);
 }
 
 int chrono_criu_available(char *error, size_t size)
 {
     const char *path = criu_path(error, size);
     if (path == NULL) return 0;
-    if (check_criu(path, error, size) != 0) {
-        error_text(error, size, "CRIU is present but its unprivileged capability/feature check failed");
-        return 0;
-    }
+    if (check_criu(path, error, size) != 0) return 0;
     return 1;
 }
 
