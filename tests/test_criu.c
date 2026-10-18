@@ -30,7 +30,40 @@ int main(int argc,char **argv)
     if(mkdtemp(base)==NULL || chmod(base,0700)!=0) return fail("temporary directory setup failed");
     (void)setenv("CHRONO_CRIU_PATH",argv[1],1);
     (void)unsetenv("CHRONO_FAKE_CRIU_FAIL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_LOG");
+    (void)unsetenv("CHRONO_FAKE_CRIU_EXIT_STATUS");
+    (void)unsetenv("CHRONO_FAKE_CRIU_SIGNAL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_PARTIAL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_PIDFILE");
+    (void)setenv("CHRONO_FAKE_CRIU_SIGNAL","check",1);
+    if(chrono_criu_available(error,sizeof(error)) ||
+       strstr(error,"CRIU kernel feature check terminated by signal 15")==NULL) {
+        remove_tree(base); return fail("signal termination was not reported accurately");
+    }
+    (void)unsetenv("CHRONO_FAKE_CRIU_SIGNAL");
     if(!chrono_criu_available(error,sizeof(error))) { remove_tree(base); return fail("fake CRIU availability check failed"); }
+    (void)setenv("CHRONO_FAKE_CRIU_EXIT_STATUS","127",1);
+    if(chrono_criu_available(error,sizeof(error)) ||
+       strstr(error,"kernel feature check failed (exit status 127)")==NULL ||
+       strstr(error,"cannot execute CRIU")!=NULL) {
+        remove_tree(base); return fail("genuine CRIU exit status 127 was confused with exec failure");
+    }
+    (void)unsetenv("CHRONO_FAKE_CRIU_EXIT_STATUS");
+    (void)setenv("CHRONO_FAKE_CRIU_EXIT_STATUS","999999999999999999999999999999",1);
+    if(chrono_criu_available(error,sizeof(error)) ||
+       strstr(error,"kernel feature check failed (exit status 97)")==NULL) {
+        remove_tree(base); return fail("fake CRIU accepted an out-of-range exit status");
+    }
+    (void)setenv("CHRONO_FAKE_CRIU_EXIT_STATUS","+1",1);
+    if(chrono_criu_available(error,sizeof(error)) ||
+       strstr(error,"kernel feature check failed (exit status 97)")==NULL) {
+        remove_tree(base); return fail("fake CRIU accepted malformed exit status syntax");
+    }
+    (void)unsetenv("CHRONO_FAKE_CRIU_EXIT_STATUS");
+    if(!chrono_criu_available(NULL,0)) { remove_tree(base); return fail("null zero-size diagnostic buffer was not supported"); }
+    (void)setenv("CHRONO_FAKE_CRIU_EXIT_STATUS","1",1);
+    if(chrono_criu_available(NULL,0)) { remove_tree(base); return fail("failed availability check mishandled null diagnostic buffer"); }
+    (void)unsetenv("CHRONO_FAKE_CRIU_EXIT_STATUS");
     chrono_checkpoint_metadata m={0}; strcpy(m.id,"sample"); m.original_pid=123;
     m.process_start_time=456; m.state=CHRONO_CHECKPOINT_PREPARING;
     char artifact[256], linkpath[280];
@@ -73,12 +106,20 @@ int main(int argc,char **argv)
     m.state=CHRONO_CHECKPOINT_COMPLETE;
     (void)setenv("CHRONO_FAKE_CRIU_FAIL","restore",1);
     if(chrono_criu_restore(&m,base,&restored,error,sizeof(error))==0 ||
-       chrono_criu_restore(&m,base,&restored,error,sizeof(error))==0) { remove_tree(base); return fail("restore failure was retried"); }
+       strstr(error,"partial restoration may have occurred") == NULL ||
+       strstr(error,"retry is unsafe") == NULL ||
+       chrono_criu_restore(&m,base,&restored,error,sizeof(error))==0) {
+        remove_tree(base); return fail("restore warning was lost or failed restore was retried");
+    }
     (void)unsetenv("CHRONO_FAKE_CRIU_FAIL");
     strcpy(m.id,"failed"); m.state=CHRONO_CHECKPOINT_PREPARING;
     (void)setenv("CHRONO_FAKE_CRIU_FAIL","dump",1);
     (void)setenv("CHRONO_FAKE_CRIU_PARTIAL","1",1);
-    if(chrono_criu_checkpoint(&m,base,error,sizeof(error))==0) { remove_tree(base); return fail("failed dump reported success"); }
+    if(chrono_criu_checkpoint(&m,base,error,sizeof(error))==0 ||
+       strstr(error,"CRIU dump failed (exit status 7)")==NULL ||
+       strstr(error,"partial artifacts retained for inspection")==NULL) {
+        remove_tree(base); return fail("failed dump reported success or lost its diagnostic");
+    }
     if(!chrono_checkpoint_artifact_valid(base,m.id)) { remove_tree(base); return fail("partial output evidence was not retained"); }
     m.state=CHRONO_CHECKPOINT_FAILED;
     if(chrono_criu_restore(&m,base,&restored,error,sizeof(error))==0) { remove_tree(base); return fail("restore accepted failed checkpoint metadata"); }
@@ -140,6 +181,27 @@ int main(int argc,char **argv)
     if(fd<0 || close(fd)!=0) { remove_tree(base); return fail("non-executable setup failed"); }
     (void)setenv("CHRONO_CRIU_PATH",linkpath,1);
     if(chrono_criu_available(error,sizeof(error))) { remove_tree(base); return fail("non-executable CRIU was accepted"); }
+    (void)snprintf(linkpath,sizeof(linkpath),"%s/bad-executable",base);
+    fd=open(linkpath,O_WRONLY|O_CREAT|O_EXCL,0700);
+    if(fd<0) {
+        remove_tree(base); return fail("exec failure setup open failed");
+    }
+    ssize_t written=write(fd,"not an executable format\n",25);
+    int close_result=close(fd);
+    if(written!=25 || close_result!=0 || chmod(linkpath,0700)!=0) {
+        remove_tree(base); return fail("exec failure setup failed");
+    }
+    (void)setenv("CHRONO_CRIU_PATH",linkpath,1);
+    if(chrono_criu_available(error,sizeof(error)) || strstr(error,"cannot execute CRIU for kernel feature check: ")==NULL) {
+        remove_tree(base); return fail("execv failure was not reported distinctly");
+    }
+    (void)unsetenv("CHRONO_FAKE_CRIU_LOG");
+    (void)unsetenv("CHRONO_FAKE_CRIU_FAIL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_EXIT_STATUS");
+    (void)unsetenv("CHRONO_FAKE_CRIU_SIGNAL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_PARTIAL");
+    (void)unsetenv("CHRONO_FAKE_CRIU_PIDFILE");
+    (void)unsetenv("CHRONO_CRIU_PATH");
     remove_tree(base);
     puts("CRIU adapter tests passed (fake executable only)");
     return 0;

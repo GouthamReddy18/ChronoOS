@@ -219,13 +219,32 @@ export CHRONO_CRIU_PATH="$HOME/criu-source/criu/criu"
 Replace `PID` and `STARTTIME` with the values printed by `launch`. Observe
 CRIU's diagnostics and both PIDs. Restore is attempted once per checkpoint ID.
 
-The fake executable in `make test` covers command execution, failure handling,
-availability checks, artifacts, and PID reporting. Passing these fake-CRIU
-tests does not establish that real checkpoint or restore works. Real
-CRIU checkpoint and restore remain unvalidated. On the specified institute
-machine the CRIU kernel-feature check has failed under the available user
-permissions. Do not change shared machine security configuration to work
-around that limit.
+The fake executable in `make test` covers argument dispatch, exit and signal
+failures, availability checks, artifacts, and PID reporting. Passing these
+fake-CRIU tests does not establish that real checkpoint or restore works. Real
+CRIU checkpoint and restore remain unvalidated. In the inspected WSL2
+environment, `/usr/sbin/criu` reports version 3.16.1 and `criu check` exits 1
+after `Unable to create a socket: Operation not permitted` while initializing
+`kerndat_tcp_repair`. The current process has zero effective, permitted, and
+bounding capabilities; `/proc/self/status` reports seccomp mode 2 with one
+filter; and `unshare -n true` also fails with `Operation not permitted`.
+These observations establish that CRIU's kernel-feature preflight cannot run
+in this execution context. They do not isolate seccomp, WSL, or another
+container/host policy as the sole cause. Do not change shared machine security
+configuration to work around that limit.
+
+For real integration work, use a disposable Linux machine or VM with CRIU
+supported kernel features, accessible procfs, and the privileges required by
+the selected workload and kernel policy. Keep integration tests separate from
+`make test`: use a dedicated managed counter, a fresh checkpoint ID, and an
+empty private checkpoint directory; run `criu check` first; checkpoint the
+counter; verify it stopped and inspect the checkpoint listing; restore once;
+verify the reported restored PID is live and its counter continues from the
+captured value; record its `/proc` start time, confirm its command line is the
+counter workload, and send SIGTERM only to that verified test PID. Preserve
+failed artifacts for diagnosis, and remove only the test's own checkpoint
+directory after confirming it contains no needed evidence. Never run this plan
+against a production process or shared state.
 
 ## Planned Architecture
 
