@@ -29,6 +29,13 @@ static int print_checkpoint(const chrono_checkpoint_metadata *m, void *context)
 
 static int checkpoint_directory(char *path, size_t size)
 {
+    const char *configured = getenv("CHRONO_CHECKPOINT_DIR");
+    const char *directory = configured != NULL && configured[0] != '\0' ? configured : NULL;
+    if (directory != NULL) {
+        if (directory[0] != '/') return -1;
+        int n = snprintf(path, size, "%s", directory);
+        return n < 0 || (size_t)n >= size ? -1 : 0;
+    }
     int n=snprintf(path,size,"/tmp/chronoos-checkpoints-%lu",(unsigned long)getuid());
     return n<0 || (size_t)n>=size ? -1 : 0;
 }
@@ -45,13 +52,16 @@ static int number(const char *s, unsigned long long max, unsigned long long *out
 int main(int argc, char **argv)
 {
     long parsed_pid;
-    char error[256];
+    char error[256] = {0};
     chrono_process_info info;
 
     if (argc == 2 && strcmp(argv[1], "checkpoints") == 0) {
         char directory[128];
-        if (checkpoint_directory(directory,sizeof(directory))!=0 ||
-            chrono_checkpoint_list(directory,print_checkpoint,directory,error,sizeof(error))!=0) {
+        if (checkpoint_directory(directory,sizeof(directory))!=0) {
+            fprintf(stderr,"chrono: invalid or too-long checkpoint directory path\n"); return 1;
+        }
+        if (chrono_checkpoint_list(directory,print_checkpoint,directory,error,sizeof(error))!=0) {
+            if (error[0] == '\0') (void)snprintf(error,sizeof(error),"cannot read checkpoint metadata");
             fprintf(stderr,"chrono: %s\n",error); return 1;
         }
         return 0;
@@ -101,8 +111,13 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "restore") == 0) {
         if (argc != 3 || !chrono_checkpoint_id_valid(argv[2])) { usage(argv[0]); return 2; }
         char directory[128]; chrono_checkpoint_metadata m; pid_t restored;
-        if (checkpoint_directory(directory,sizeof(directory))!=0 ||
-            chrono_checkpoint_read(directory,argv[2],&m,error,sizeof(error))!=0) { fprintf(stderr,"chrono: %s\n",error); return 1; }
+        if (checkpoint_directory(directory,sizeof(directory))!=0) {
+            fprintf(stderr,"chrono: invalid or too-long checkpoint directory path\n"); return 1;
+        }
+        if (chrono_checkpoint_read(directory,argv[2],&m,error,sizeof(error))!=0) {
+            if (error[0] == '\0') (void)snprintf(error,sizeof(error),"cannot read checkpoint metadata");
+            fprintf(stderr,"chrono: %s\n",error); return 1;
+        }
         if (m.state!=CHRONO_CHECKPOINT_COMPLETE) { fprintf(stderr,"chrono: checkpoint is not complete\n"); return 1; }
         if (strcmp(m.backend,"criu")!=0) { fprintf(stderr,"chrono: checkpoint metadata uses an unsupported backend\n"); return 1; }
         const chrono_checkpoint_backend *backend=chrono_checkpoint_backend_get();

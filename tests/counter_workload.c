@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -47,7 +49,32 @@ int main(int argc, char **argv)
     }
 
     unsigned long long counter = 0;
+    const char *state_path = getenv("CHRONO_TEST_STATE_FILE");
+    int state_fd = -1;
+    if (state_path != NULL && state_path[0] != '\0') {
+        struct stat state_stat;
+        state_fd = open(state_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (state_fd < 0 || fstat(state_fd, &state_stat) != 0 || !S_ISREG(state_stat.st_mode) ||
+            state_stat.st_uid != getuid() || fchmod(state_fd, 0600) != 0) {
+            if (state_fd >= 0) (void)close(state_fd);
+            perror("counter_workload: test state file");
+            return 1;
+        }
+    }
     while (!stop_requested) {
+        if (state_fd >= 0) {
+            char state[64];
+            int state_length = snprintf(state, sizeof(state), "%llu\n", counter);
+            ssize_t state_written = -1;
+            int state_error = ftruncate(state_fd, 0) != 0 || lseek(state_fd, 0, SEEK_SET) < 0;
+            if (!state_error) state_written = write(state_fd, state, (size_t)state_length);
+            if (state_written != (ssize_t)state_length) state_error = 1;
+            if (state_error) {
+                perror("counter_workload: test state file");
+                (void)close(state_fd);
+                return 1;
+            }
+        }
         printf("pid=%ld counter=%llu\n", (long)getpid(), counter++);
         fflush(stdout);
         struct timespec remaining = {.tv_sec = interval, .tv_nsec = 0};
@@ -59,5 +86,6 @@ int main(int argc, char **argv)
         }
     }
     printf("pid=%ld stopping counter=%llu\n", (long)getpid(), counter);
+    if (state_fd >= 0) (void)close(state_fd);
     return 0;
 }
