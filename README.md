@@ -199,6 +199,16 @@ restored PID is reported from CRIU's PID file; restore normally
 uses a new PID and does not replace the original Phase 2 registry entry. A
 successful CRIU dump normally terminates the original process.
 
+The adapter waits synchronously for CRIU and has no internal operation
+timeout. Direct CLI checkpoint or restore calls can therefore wait
+indefinitely. The opt-in integration harness places GNU `timeout` bounds
+around preflight and CLI calls. A timeout does not prove CRIU stopped or that
+restore had no effect: dump output may be partial and a restore may have
+partially succeeded. Preserve the artifacts and diagnostics, and do not retry
+an ambiguous restore. No adapter-level timeout policy is implemented because
+terminating CRIU safely and interpreting its partially completed operation
+requires explicit operation-specific recovery semantics.
+
 The managed counter is detached into its own session, while CRIU operates on
 process trees. Restore may depend on namespace, kernel feature, capability,
 security policy, file, socket, mount, and network support for the captured
@@ -295,6 +305,21 @@ Phase 3C preparation does not establish full CRIU image compatibility or
 restorability across workload resources and kernel versions. Phase 4 remains
 to validate real runs on supported hosts, characterize unsupported process
 resources and failure recovery, and measure checkpoint/restore behavior.
+
+### Phase 4 validation status
+
+- **IMPLEMENTED:** managed counter lifecycle, checkpoint metadata and artifact
+  checks, CRIU adapter, and an opt-in integration harness with preflight and
+  bounded CLI calls.
+- **TESTED WITH FAKE CRIU:** adapter arguments, artifacts, metadata outcomes,
+  PID-file validation, and failure diagnostics through `make test`.
+- **TESTED WITH REAL CRIU:** none; no real dump or restore was attempted, so
+  no real integration result is claimed.
+- **ENVIRONMENT-BLOCKED:** the inspected WSL2 context fails `criu check` at
+  TCP_REPAIR socket setup with `Operation not permitted`. The integration
+  target reports preflight blocked (77) before launching a workload.
+- **NOT YET VERIFIED:** real CRIU image compatibility, end-to-end restoration,
+  and behavior across unsupported process resources and kernel versions.
 
 ## Planned Architecture
 
