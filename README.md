@@ -147,9 +147,11 @@ validates CRIU inventory and file ownership/modes before restore.
 
 The CRIU adapter executes the CRIU binary directly with an argument vector; it
 does not use a shell. Set `CHRONO_CRIU_PATH` when CRIU is not at the documented
-fallback path `/usr/sbin/criu`. Before each operation ChronoOS runs
-`criu check --unprivileged` and fails closed when that capability and feature
-check does not pass. ChronoOS does not install CRIU or change system
+fallback path `/usr/sbin/criu`. Before each operation ChronoOS runs plain
+`criu check` and fails closed when the required kernel feature check does not
+pass. This checks CRIU's required kernel features in the current execution
+context; it does not guarantee that a particular process can be dumped or
+restored. ChronoOS does not install CRIU or change system
 capabilities. CRIU needs access to the target's `/proc` information and uses
 ptrace while collecting process state. Kernel support such as
 `CONFIG_CHECKPOINT_RESTORE` and, depending on the process and operation,
@@ -197,6 +199,16 @@ restored PID is reported from CRIU's PID file; restore normally
 uses a new PID and does not replace the original Phase 2 registry entry. A
 successful CRIU dump normally terminates the original process.
 
+The adapter waits synchronously for CRIU and has no internal operation
+timeout. Direct CLI checkpoint or restore calls can therefore wait
+indefinitely. The opt-in integration harness places GNU `timeout` bounds
+around preflight and CLI calls. A timeout does not prove CRIU stopped or that
+restore had no effect: dump output may be partial and a restore may have
+partially succeeded. Preserve the artifacts and diagnostics, and do not retry
+an ambiguous restore. No adapter-level timeout policy is implemented because
+terminating CRIU safely and interpreting its partially completed operation
+requires explicit operation-specific recovery semantics.
+
 The managed counter is detached into its own session, while CRIU operates on
 process trees. Restore may depend on namespace, kernel feature, capability,
 security policy, file, socket, mount, and network support for the captured
@@ -217,16 +229,102 @@ export CHRONO_CRIU_PATH="$HOME/criu-source/criu/criu"
 Replace `PID` and `STARTTIME` with the values printed by `launch`. Observe
 CRIU's diagnostics and both PIDs. Restore is attempted once per checkpoint ID.
 
-The fake executable in `make test` covers command execution, failure handling,
-availability checks, artifacts, and PID reporting. It does not establish that
-real checkpoint or restore works. No successful real dump or restore has been
-verified for this project. On the institute host checked on 2026-10-28,
-`criu` was not found on `PATH` and `/usr/sbin/criu` was absent, so neither
-`criu check` nor ChronoOS's `criu check --unprivileged` preflight could run.
-This establishes an installation blocker only; it does not establish that the
-host's kernel or permissions would pass CRIU checks if CRIU were installed.
-Do not change shared machine security configuration to work around a failed
-preflight.
+The fake executable in `make test` covers argument dispatch, exit and signal
+failures, availability checks, artifacts, and PID reporting. Passing these
+fake-CRIU tests does not establish that real checkpoint or restore works. Real
+CRIU checkpoint and restore remain unvalidated.
+
+On the institute host checked on 2026-10-28, `criu` was not found on `PATH`
+and `/usr/sbin/criu` was absent, so neither `criu check` nor the then-configured
+ChronoOS `criu check --unprivileged` preflight could run. This establishes an
+installation blocker only; it does not establish that the host's kernel or
+permissions would pass CRIU checks if CRIU were installed.
+
+In the inspected WSL2 environment, `/usr/sbin/criu` reports version 3.16.1
+and `criu check` exits 1 after `Unable to create a socket: Operation not
+permitted` while initializing `kerndat_tcp_repair`. The current process has
+zero effective, permitted, and bounding capabilities; `/proc/self/status`
+reports seccomp mode 2 with one filter; and `unshare -n true` also fails with
+`Operation not permitted`. These observations establish that CRIU's
+kernel-feature preflight cannot run in this execution context. They do not
+isolate seccomp, WSL, or another container/host policy as the sole cause. Do
+not change shared machine security configuration to work around these limits.
+
+For real integration work, use a disposable Linux machine or VM with CRIU
+supported kernel features, accessible procfs, and the privileges required by
+the selected workload and kernel policy. Keep integration tests separate from
+`make test`: use a dedicated managed counter, a fresh checkpoint ID, and an
+empty private checkpoint directory; run `criu check` first; checkpoint the
+counter; verify it stopped and inspect the checkpoint listing; restore once;
+verify the reported restored PID is live and its counter continues from the
+captured value; record its `/proc` start time, confirm its command line is the
+counter workload, and send SIGTERM only to that verified test PID. Preserve
+failed artifacts for diagnosis, and remove only the test's own checkpoint
+directory after confirming it contains no needed evidence. Never run this plan
+against a production process or shared state.
+
+## Phase 3C: real CRIU readiness and opt-in validation
+
+Phase 3B is the completed adapter work described above. Phase 3C adds a
+separate opt-in target, `make test-criu-integration`; normal `make test` remains
+independent of real CRIU privileges. The integration target runs `criu check`
+before launching anything. A failed check is reported as **preflight blocked**
+(exit 77), and the script does not invoke `criu dump` or `criu restore` in that
+case. Missing `timeout` is reported as a skipped test. On a host that passes
+preflight, the script uses a dedicated ChronoOS counter, an isolated mode-0700
+checkpoint directory, a fresh ID, and bounded waits. The counter writes an
+optional test-only observable value when `CHRONO_TEST_STATE_FILE` is set. The
+script verifies completed metadata and artifacts, the restored executable and
+owner, and that the observable counter advances after restore only after the
+original PID/start-time is confirmed stopped and the restored process is
+identified. The state file by itself is not treated as proof of restoration.
+It terminates the restored process through a pidfd helper only after checking
+its executable, UID, PID, and start time against the process it identified.
+If pidfd validation fails, cleanup does not fall back to signaling by PID.
+Test artifacts are deliberately left
+in the printed directory for review; remove only that specific generated
+directory after inspection.
+
+`CHRONO_CHECKPOINT_DIR` allows an absolute, private directory to be supplied
+for an isolated run. The normal CLI default remains
+`/tmp/chronoos-checkpoints-UID`; metadata and artifact code still validate
+ownership, permissions, and symlink handling. Run the safe suite and the
+opt-in real integration attempt with:
+
+```sh
+make
+make test
+make test-criu-integration
+```
+
+In the inspected WSL2 execution context described above, `criu check` fails at
+TCP_REPAIR socket setup. The integration harness must pass its own preflight
+before attempting either operation; its expected blocked result is exit 77,
+before launching a workload. No real dump/restore result is claimed. A
+supported isolated Linux installation or disposable VM must provide
+CRIU-supported kernel features, accessible procfs, and the permissions
+required by the selected process; a generic container or another WSL
+distribution is not presumed suitable.
+
+Phase 3C preparation does not establish full CRIU image compatibility or
+restorability across workload resources and kernel versions. Phase 4 remains
+to validate real runs on supported hosts, characterize unsupported process
+resources and failure recovery, and measure checkpoint/restore behavior.
+
+### Phase 4 validation status
+
+- **IMPLEMENTED:** managed counter lifecycle, checkpoint metadata and artifact
+  checks, CRIU adapter, and an opt-in integration harness with preflight and
+  bounded CLI calls.
+- **TESTED WITH FAKE CRIU:** adapter arguments, artifacts, metadata outcomes,
+  PID-file validation, and failure diagnostics through `make test`.
+- **TESTED WITH REAL CRIU:** none; no real dump or restore was attempted, so
+  no real integration result is claimed.
+- **ENVIRONMENT-BLOCKED:** the inspected WSL2 context fails `criu check` at
+  TCP_REPAIR socket setup with `Operation not permitted`. The integration
+  target reports preflight blocked (77) before launching a workload.
+- **NOT YET VERIFIED:** real CRIU image compatibility, end-to-end restoration,
+  and behavior across unsupported process resources and kernel versions.
 
 ## Planned Architecture
 

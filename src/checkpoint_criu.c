@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "chrono/checkpoint_criu.h"
 
@@ -34,21 +35,91 @@ static const char *criu_path(char *error, size_t size)
 static int run_criu(const char *operation, const char *path, char *const args[],
                     char *error, size_t size)
 {
+    int exec_pipe[2];
+    if (pipe2(exec_pipe, O_CLOEXEC) != 0) {
+        int pipe_error = errno;
+        char message[128];
+        (void)snprintf(message, sizeof(message), "cannot create CRIU exec-status pipe: %s", strerror(pipe_error));
+        error_text(error, size, message); return -1;
+    }
     pid_t child = fork();
-    if (child < 0) { error_text(error, size, "cannot start CRIU"); return -1; }
+    if (child < 0) {
+        int fork_error = errno;
+        close(exec_pipe[0]); close(exec_pipe[1]);
+        char message[128];
+        (void)snprintf(message, sizeof(message), "cannot start CRIU for %s: %s", operation, strerror(fork_error));
+        error_text(error, size, message); return -1;
+    }
     if (child == 0) {
+        close(exec_pipe[0]);
         (void)umask(0077);
         execv(path, args);
+        int exec_error = errno;
+        const unsigned char *data = (const unsigned char *)&exec_error;
+        size_t remaining = sizeof(exec_error);
+        while (remaining != 0) {
+            ssize_t written = write(exec_pipe[1], data, remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) break;
+            data += (size_t)written;
+            remaining -= (size_t)written;
+        }
         _exit(127);
+    }
+    close(exec_pipe[1]);
+    int exec_error = 0;
+    size_t exec_used = 0;
+    int read_error = 0;
+    while (exec_used < sizeof(exec_error)) {
+        ssize_t count = read(exec_pipe[0], (unsigned char *)&exec_error + exec_used,
+                             sizeof(exec_error) - exec_used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) { read_error = errno; break; }
+        if (count == 0) break;
+        exec_used += (size_t)count;
+    }
+    close(exec_pipe[0]);
+    if (read_error != 0) {
+        char message[160];
+        (void)snprintf(message, sizeof(message), "cannot read CRIU exec-status pipe for %s: %s",
+                       operation, strerror(read_error));
+        error_text(error, size, message);
+        int ignored_status;
+        while (waitpid(child, &ignored_status, 0) < 0 && errno == EINTR) {}
+        return -1;
+    }
+    if (exec_used != 0 && exec_used != sizeof(exec_error)) {
+        char message[128];
+        (void)snprintf(message, sizeof(message),
+                       "unexpected partial read from CRIU exec-status pipe for %s (%zd of %zu bytes)",
+                       operation, (ssize_t)exec_used, sizeof(exec_error));
+        error_text(error, size, message);
+        int ignored_status;
+        while (waitpid(child, &ignored_status, 0) < 0 && errno == EINTR) {}
+        return -1;
     }
     int status;
     pid_t waited;
     do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
-    if (waited < 0) { error_text(error, size, "cannot collect CRIU exit status"); return -1; }
+    if (waited < 0) {
+        char message[128];
+        (void)snprintf(message, sizeof(message), "cannot collect CRIU exit status for %s: %s",
+                       operation, strerror(errno));
+        error_text(error, size, message); return -1;
+    }
+    if (exec_used == sizeof(exec_error)) {
+        char message[160];
+        (void)snprintf(message, sizeof(message), "cannot execute CRIU for %s: %s", operation,
+                       strerror(exec_error));
+        error_text(error, size, message); return -1;
+    }
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
-        error_text(error, size, "cannot execute CRIU");
-    else if (WIFSIGNALED(status)) error_text(error, size, "CRIU was interrupted by a signal");
+    if (WIFSIGNALED(status)) {
+        char message[128];
+        (void)snprintf(message, sizeof(message), "CRIU %s terminated by signal %d", operation,
+                       WTERMSIG(status));
+        error_text(error, size, message);
+    }
     else {
         char message[96];
         (void)snprintf(message, sizeof(message), "CRIU %s failed (exit status %d)", operation,
@@ -60,18 +131,15 @@ static int run_criu(const char *operation, const char *path, char *const args[],
 
 static int check_criu(const char *path, char *error, size_t size)
 {
-    char *args[] = {(char *)path, "check", "--unprivileged", NULL};
-    return run_criu("capability check", path, args, error, size);
+    char *args[] = {(char *)path, "check", NULL};
+    return run_criu("kernel feature check", path, args, error, size);
 }
 
 int chrono_criu_available(char *error, size_t size)
 {
     const char *path = criu_path(error, size);
     if (path == NULL) return 0;
-    if (check_criu(path, error, size) != 0) {
-        error_text(error, size, "CRIU is present but its unprivileged capability/feature check failed");
-        return 0;
-    }
+    if (check_criu(path, error, size) != 0) return 0;
     return 1;
 }
 
@@ -134,7 +202,13 @@ int chrono_criu_checkpoint(const chrono_checkpoint_metadata *m, const char *base
     char *args[] = {(char *)path, "dump", "--tree", pid, "--images-dir", artifact,
                     "--shell-job", NULL};
     if (run_criu("dump", path, args, error, size) != 0) {
-        error_text(error, size, "CRIU dump failed; partial artifacts retained for inspection");
+        char prior[256], message[384];
+        prior[0] = '\0';
+        if (error != NULL && size != 0 && error[0] != '\0')
+            (void)snprintf(prior, sizeof(prior), "%s", error);
+        if (prior[0] == '\0') (void)snprintf(prior, sizeof(prior), "%s", "CRIU dump failed");
+        (void)snprintf(message, sizeof(message), "%s; partial artifacts retained for inspection", prior);
+        error_text(error, size, message);
         return -1;
     }
     if (!chrono_checkpoint_artifact_valid(base, m->id)) {
@@ -183,7 +257,9 @@ int chrono_criu_restore(const chrono_checkpoint_metadata *m, const char *base,
                     "--restore-detached", "--pidfile", pidfile, NULL};
     if (run_criu("restore", path, args, error, size) != 0) {
         char prior[256];
-        (void)snprintf(prior, sizeof(prior), "%s", error != NULL ? error : "CRIU restore failed");
+        const char *diagnostic = error != NULL && size != 0 && error[0] != '\0' ?
+                                 error : "CRIU restore failed";
+        (void)snprintf(prior, sizeof(prior), "%s", diagnostic);
         char message[320];
         (void)snprintf(message, sizeof(message), "%s; partial restoration may have occurred and retry is unsafe", prior);
         error_text(error, size, message);
