@@ -65,8 +65,17 @@ cleanup_stop_managed() {
 cleanup_managed() {
     [ "$cleanup_done" -eq 0 ] || return 0
     cleanup_done=1
+    needs_registry_cleanup=0
+    if [ "$fixture_created" -eq 1 ] || [ "$registry_mode_changed" -eq 1 ] ||
+       [ -n "${permission_pid:-}" ] || [ -n "${managed_pid:-}" ] ||
+       [ -n "${path_pid:-}" ] || [ -n "${link_pid:-}" ] ||
+       [ -n "${repeated_pid:-}" ]; then
+        needs_registry_cleanup=1
+    fi
     registry_ready=1
-    if [ "$registry_mode_changed" -eq 1 ]; then
+    if [ "$needs_registry_cleanup" -eq 0 ]; then
+        :
+    elif [ "$registry_mode_changed" -eq 1 ]; then
         restored=0
         attempt=0
         while [ "$attempt" -lt 3 ]; do
@@ -163,7 +172,7 @@ grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
 expect_status 1 "$CHRONO" checkpoint 1 1 review
 grep -q '^chrono: managed identity validation failed:' ./build/test-output.log
 expect_status 1 "$CHRONO" restore review
-grep -Fxq 'chrono: cannot read checkpoint metadata' ./build/test-output.log
+grep -Fxq 'chrono: cannot open checkpoint metadata' ./build/test-output.log
 expect_status 2 "$CHRONO" checkpoint 1 1
 expect_status 2 "$CHRONO" restore
 expect_status 2 "$CHRONO" checkpoint nope 1 review
@@ -362,5 +371,8 @@ for iteration in 1 2 3; do
     repeated_start=
 done
 
+# The suite has no remaining managed identities here, so cleanup must not
+# require a registry directory that this run never created.
+cleanup_managed
 trap - EXIT HUP INT TERM
 echo "Phase 1 and Phase 2 regression tests passed"

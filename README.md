@@ -219,10 +219,14 @@ CRIU's diagnostics and both PIDs. Restore is attempted once per checkpoint ID.
 
 The fake executable in `make test` covers command execution, failure handling,
 availability checks, artifacts, and PID reporting. It does not establish that
-real checkpoint or restore works. On the specified institute machine CRIU's
-unprivileged check currently fails because the user lacks effective
-capabilities. Do not change shared machine security configuration to work
-around that limit.
+real checkpoint or restore works. No successful real dump or restore has been
+verified for this project. On the institute host checked on 2026-10-28,
+`criu` was not found on `PATH` and `/usr/sbin/criu` was absent, so neither
+`criu check` nor ChronoOS's `criu check --unprivileged` preflight could run.
+This establishes an installation blocker only; it does not establish that the
+host's kernel or permissions would pass CRIU checks if CRIU were installed.
+Do not change shared machine security configuration to work around a failed
+preflight.
 
 ## Planned Architecture
 
