@@ -329,6 +329,9 @@ int chrono_checkpoint_artifact_valid(const char *directory, const char *id)
         } else if (strcmp(entry->d_name, "restore.pid") == 0) {
             if (item.st_size <= 0 || item.st_size > 31 || (item.st_mode & 0077) != 0 ||
                 (item.st_mode & 0400) == 0) { valid = 0; break; }
+        } else if (strcmp(entry->d_name, "stats-dump") == 0 ||
+                   strcmp(entry->d_name, "stats-restore") == 0) {
+            if (item.st_size <= 0) { valid = 0; break; }
         } else {
             /* This adapter supports flat CRIU image directories only. */
             (void)close(itemfd);
@@ -346,5 +349,345 @@ done:
     else if (scanfd >= 0) (void)close(scanfd);
     if (artifactfd >= 0 && close(artifactfd) != 0) result = 0;
     if (basefd >= 0 && close(basefd) != 0) result = 0;
+    return result;
+}
+
+int chrono_checkpoint_use_lock(const char *directory, int exclusive,
+                               char *error, size_t error_size)
+{
+    int dirfd = -1;
+    struct stat st;
+    if (open_directory(directory, 0, &dirfd) != 0) {
+        set_error(error, error_size, "cannot open private checkpoint directory for use lock");
+        return -1;
+    }
+    int fd = openat(dirfd, ".chrono-use.lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int saved = errno;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+        st.st_nlink != 1 || (st.st_mode & 0777) != 0600) {
+        if (fd >= 0) close(fd);
+        close(dirfd);
+        errno = fd < 0 ? saved : EPERM;
+        set_error(error, error_size, "checkpoint use lock has unsafe type, owner, link count, or mode");
+        return -1;
+    }
+    int operation = exclusive ? LOCK_EX : LOCK_SH;
+    while (flock(fd, operation) != 0) {
+        if (errno == EINTR) continue;
+        saved = errno;
+        close(fd); close(dirfd); errno = saved;
+        set_error(error, error_size, "cannot acquire checkpoint use lock");
+        return -1;
+    }
+    if (close(dirfd) != 0) {
+        saved = errno; (void)flock(fd, LOCK_UN); close(fd); errno = saved;
+        set_error(error, error_size, "cannot close checkpoint directory after locking");
+        return -1;
+    }
+    return fd;
+}
+
+static int checkpoint_newer(const chrono_checkpoint_metadata *left,
+                            const chrono_checkpoint_metadata *right)
+{
+    if (left->created_at != right->created_at) return left->created_at > right->created_at;
+    return strcmp(left->id, right->id) > 0;
+}
+
+static int read_latest_id(int dirfd, const char *workload, char *id, size_t id_size)
+{
+    char name[CHRONO_CHECKPOINT_ID_MAX + 16];
+    struct stat st;
+    (void)snprintf(name, sizeof(name), "latest-%s", workload);
+    int fd = openat(dirfd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+        st.st_nlink != 1 || (st.st_mode & 0777) != 0600 || st.st_size < 2 ||
+        st.st_size > CHRONO_CHECKPOINT_ID_MAX + 1) {
+        close(fd); errno = EINVAL; return -1;
+    }
+    size_t used = 0;
+    int read_failed = 0;
+    while (used < id_size) {
+        ssize_t got = read(fd, id + used, id_size - used);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) { read_failed = 1; break; }
+        if (got == 0) break;
+        used += (size_t)got;
+    }
+    int close_result = close(fd);
+    if (read_failed || used < 2 || used >= id_size || close_result != 0) {
+        if (!read_failed) errno = EINVAL;
+        return -1;
+    }
+    if (id[used - 1] != '\n') { errno = EINVAL; return -1; }
+    id[used - 1] = '\0';
+    return chrono_checkpoint_id_valid(id) ? 0 : (errno = EINVAL, -1);
+}
+
+static int write_latest_locked(int dirfd, const char *workload, const char *id)
+{
+    char name[CHRONO_CHECKPOINT_ID_MAX + 16];
+    char temp[CHRONO_CHECKPOINT_ID_MAX + 48];
+    struct stat st;
+    int n1 = snprintf(name, sizeof(name), "latest-%s", workload);
+    int n2 = snprintf(temp, sizeof(temp), ".latest-%s-%ld.tmp", workload, (long)getpid());
+    if (n1 < 0 || (size_t)n1 >= sizeof(name) || n2 < 0 || (size_t)n2 >= sizeof(temp)) {
+        errno = ENAMETOOLONG; return -1;
+    }
+    int fd = openat(dirfd, temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    int valid = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid() &&
+                st.st_nlink == 1 && fchmod(fd, 0600) == 0;
+    char value[CHRONO_CHECKPOINT_ID_MAX + 2];
+    int length = snprintf(value, sizeof(value), "%s\n", id);
+    int saved = errno;
+    if (!valid || length < 0 || (size_t)length >= sizeof(value) ||
+        write_all(fd, value, (size_t)length) != 0 || fsync(fd) != 0) {
+        saved = errno != 0 ? errno : EIO;
+        close(fd); (void)unlinkat(dirfd, temp, 0); errno = saved; return -1;
+    }
+    if (close(fd) != 0) { saved = errno; (void)unlinkat(dirfd, temp, 0); errno = saved; return -1; }
+    if (renameat(dirfd, temp, dirfd, name) != 0) {
+        saved = errno; (void)unlinkat(dirfd, temp, 0); errno = saved; return -1;
+    }
+    return fsync(dirfd);
+}
+
+int chrono_checkpoint_publish_latest(const char *directory, const char *workload,
+                                     const char *id, char *error, size_t error_size)
+{
+    if (!chrono_checkpoint_id_valid(workload) || !chrono_checkpoint_id_valid(id)) {
+        set_error(error, error_size, "invalid workload or checkpoint identifier for latest reference");
+        return -1;
+    }
+    chrono_checkpoint_metadata candidate, current;
+    if (chrono_checkpoint_read(directory, id, &candidate, error, error_size) != 0 ||
+        candidate.state != CHRONO_CHECKPOINT_COMPLETE || strcmp(candidate.workload, workload) != 0 ||
+        !chrono_checkpoint_artifact_valid(directory, id)) {
+        set_error(error, error_size, "latest reference requires a matching complete checkpoint with valid artifacts");
+        return -1;
+    }
+    int lock = chrono_checkpoint_use_lock(directory, 1, error, error_size);
+    if (lock < 0) return -1;
+    int dirfd = -1, result = -1;
+    if (chrono_checkpoint_read(directory, id, &candidate, error, error_size) != 0 ||
+        candidate.state != CHRONO_CHECKPOINT_COMPLETE || strcmp(candidate.workload, workload) != 0 ||
+        !chrono_checkpoint_artifact_valid(directory, id)) goto done;
+    char prior_id[CHRONO_CHECKPOINT_ID_MAX + 1];
+    if (open_directory(directory, 0, &dirfd) != 0) goto done;
+    if (read_latest_id(dirfd, workload, prior_id, sizeof(prior_id)) == 0 &&
+        chrono_checkpoint_read(directory, prior_id, &current, NULL, 0) == 0 &&
+        current.state == CHRONO_CHECKPOINT_COMPLETE && strcmp(current.workload, workload) == 0 &&
+        chrono_checkpoint_artifact_valid(directory, prior_id) && !checkpoint_newer(&candidate, &current)) {
+        result = 0;
+        goto done;
+    }
+    if (write_latest_locked(dirfd, workload, id) != 0) goto done;
+    result = 0;
+done:
+    if (dirfd >= 0 && close(dirfd) != 0) result = -1;
+    if (flock(lock, LOCK_UN) != 0) result = -1;
+    if (close(lock) != 0) result = -1;
+    if (result != 0) set_error(error, error_size, "cannot atomically publish latest-valid checkpoint reference");
+    return result;
+}
+
+int chrono_checkpoint_latest(const char *directory, const char *workload,
+                             chrono_checkpoint_metadata *metadata,
+                             char *error, size_t error_size)
+{
+    if (!chrono_checkpoint_id_valid(workload) || metadata == NULL) {
+        set_error(error, error_size, "invalid workload identifier or metadata output"); return -1;
+    }
+    int lock = chrono_checkpoint_use_lock(directory, 0, error, error_size);
+    if (lock < 0) return -1;
+    int dirfd = -1, found = 0;
+    char id[CHRONO_CHECKPOINT_ID_MAX + 1];
+    if (open_directory(directory, 0, &dirfd) == 0 && read_latest_id(dirfd, workload, id, sizeof(id)) == 0 &&
+        chrono_checkpoint_read(directory, id, metadata, NULL, 0) == 0 &&
+        metadata->state == CHRONO_CHECKPOINT_COMPLETE && strcmp(metadata->workload, workload) == 0 &&
+        chrono_checkpoint_artifact_valid(directory, id)) found = 1;
+    if (dirfd >= 0) close(dirfd);
+    (void)flock(lock, LOCK_UN); close(lock);
+    if (found) return 0;
+
+    /* A missing or stale reference is recovered by scanning complete valid records. */
+    lock = chrono_checkpoint_use_lock(directory, 0, error, error_size);
+    if (lock < 0) return -1;
+    if (open_directory(directory, 0, &dirfd) != 0) {
+        (void)flock(lock, LOCK_UN); close(lock);
+        set_error(error, error_size, "no valid checkpoint reference or checkpoint directory"); return -1;
+    }
+    int duplicate = dup(dirfd);
+    DIR *stream = duplicate < 0 ? NULL : fdopendir(duplicate);
+    if (stream == NULL) {
+        if (duplicate >= 0) close(duplicate);
+        close(dirfd); (void)flock(lock, LOCK_UN); close(lock);
+        set_error(error, error_size, "cannot scan checkpoint metadata"); return -1;
+    }
+    int scan_failed = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        if (n < 6 || strcmp(entry->d_name + n - 5, ".meta") != 0) continue;
+        size_t length = n - 5;
+        if (length > CHRONO_CHECKPOINT_ID_MAX) continue;
+        memcpy(id, entry->d_name, length); id[length] = '\0';
+        chrono_checkpoint_metadata item;
+        if (!chrono_checkpoint_id_valid(id) || read_metadata(dirfd, id, &item) != 0) {
+            scan_failed = 1; break;
+        }
+        if (item.state == CHRONO_CHECKPOINT_COMPLETE && strcmp(item.workload, workload) == 0 &&
+            chrono_checkpoint_artifact_valid(directory, id) &&
+            (!found || checkpoint_newer(&item, metadata))) {
+            *metadata = item; found = 1;
+        }
+    }
+    if (closedir(stream) != 0) scan_failed = 1;
+    close(dirfd);
+    (void)flock(lock, LOCK_UN); close(lock);
+    if (!found || scan_failed) {
+        set_error(error, error_size, scan_failed ? "checkpoint metadata scan failed" : "no valid checkpoint for workload");
+        return -1;
+    }
+    if (chrono_checkpoint_publish_latest(directory, workload, metadata->id, error, error_size) != 0)
+        return -1;
+    return 0;
+}
+
+typedef struct {
+    chrono_checkpoint_metadata metadata;
+    int valid_artifact;
+} retention_item;
+
+static int retention_compare(const void *a, const void *b)
+{
+    const retention_item *left = a, *right = b;
+    if (checkpoint_newer(&left->metadata, &right->metadata)) return -1;
+    if (checkpoint_newer(&right->metadata, &left->metadata)) return 1;
+    return 0;
+}
+
+static int remove_checkpoint_artifact(int dirfd, const char *id)
+{
+    struct stat st;
+    int artifact = openat(dirfd, id, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (artifact < 0 || fstat(artifact, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 0777) != 0700) {
+        if (artifact >= 0) close(artifact);
+        errno = EPERM; return -1;
+    }
+    int duplicate = dup(artifact);
+    DIR *stream = duplicate < 0 ? NULL : fdopendir(duplicate);
+    if (stream == NULL) { if (duplicate >= 0) close(duplicate); close(artifact); return -1; }
+    int result = 0;
+    struct dirent *entry;
+    /* Validate the full flat directory before removing any image. */
+    while ((entry = readdir(stream)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        struct stat item;
+        int fd = openat(artifact, entry->d_name, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 || fstat(fd, &item) != 0 || !S_ISREG(item.st_mode) || item.st_uid != getuid() ||
+            item.st_nlink != 1 || (item.st_mode & 0077) != 0) {
+            if (fd >= 0) close(fd);
+            result = -1; errno = EPERM; break;
+        }
+        if (close(fd) != 0) { result = -1; break; }
+    }
+    if (closedir(stream) != 0) result = -1;
+    if (result == 0) {
+        if (lseek(artifact, 0, SEEK_SET) < 0) result = -1;
+    }
+    if (result == 0) {
+        duplicate = dup(artifact);
+        stream = duplicate < 0 ? NULL : fdopendir(duplicate);
+        if (stream == NULL) {
+            if (duplicate >= 0) close(duplicate);
+            result = -1;
+        } else {
+            while ((entry = readdir(stream)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+                if (unlinkat(artifact, entry->d_name, 0) != 0) { result = -1; break; }
+            }
+            if (closedir(stream) != 0) result = -1;
+        }
+    }
+    if (result == 0 && fsync(artifact) != 0) result = -1;
+    if (close(artifact) != 0) result = -1;
+    if (result == 0 && unlinkat(dirfd, id, AT_REMOVEDIR) != 0) result = -1;
+    return result;
+}
+
+int chrono_checkpoint_retain(const char *directory, const char *workload,
+                             size_t maximum, char *error, size_t error_size)
+{
+    if (!chrono_checkpoint_id_valid(workload) || maximum == 0 || maximum > 100) {
+        set_error(error, error_size, "retention requires a valid workload ID and limit from 1 to 100"); return -1;
+    }
+    int lock = chrono_checkpoint_use_lock(directory, 1, error, error_size);
+    if (lock < 0) return -1;
+    int dirfd = -1, result = -1;
+    retention_item *items = calloc(4096, sizeof(*items));
+    if (items == NULL || open_directory(directory, 0, &dirfd) != 0) goto done;
+    int duplicate = dup(dirfd);
+    DIR *stream = duplicate < 0 ? NULL : fdopendir(duplicate);
+    if (stream == NULL) { if (duplicate >= 0) close(duplicate); goto done; }
+    size_t count = 0;
+    int scan_failed = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) {
+        size_t n = strlen(entry->d_name);
+        if (n < 6 || strcmp(entry->d_name + n - 5, ".meta") != 0) continue;
+        size_t length = n - 5;
+        if (length > CHRONO_CHECKPOINT_ID_MAX) continue;
+        char id[CHRONO_CHECKPOINT_ID_MAX + 1];
+        memcpy(id, entry->d_name, length); id[length] = '\0';
+        chrono_checkpoint_metadata item;
+        if (!chrono_checkpoint_id_valid(id) || read_metadata(dirfd, id, &item) != 0) { scan_failed = 1; break; }
+        if (item.state != CHRONO_CHECKPOINT_COMPLETE || strcmp(item.workload, workload) != 0) continue;
+        if (count == 4096) { scan_failed = 1; errno = EOVERFLOW; break; }
+        items[count].metadata = item;
+        items[count].valid_artifact = chrono_checkpoint_artifact_valid(directory, id);
+        ++count;
+    }
+    if (closedir(stream) != 0) scan_failed = 1;
+    if (scan_failed) goto done;
+    qsort(items, count, sizeof(*items), retention_compare);
+    char latest[CHRONO_CHECKPOINT_ID_MAX + 1] = {0};
+    int latest_valid = 0;
+    if (read_latest_id(dirfd, workload, latest, sizeof(latest)) == 0) {
+        for (size_t i = 0; i < count; ++i)
+            if (items[i].valid_artifact && strcmp(items[i].metadata.id, latest) == 0)
+                latest_valid = 1;
+    }
+    if (!latest_valid) {
+        /* Repair references from the sorted list before deleting anything. */
+        if (count == 0 || !items[0].valid_artifact ||
+            write_latest_locked(dirfd, workload, items[0].metadata.id) != 0) goto done;
+        (void)snprintf(latest, sizeof(latest), "%s", items[0].metadata.id);
+    }
+    result = 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!items[i].valid_artifact) continue; /* uncertain artifacts are preserved */
+        if (strcmp(items[i].metadata.id, latest) == 0) {
+            continue;
+        }
+        if (kept < maximum - 1) {
+            ++kept; continue;
+        }
+        if (remove_checkpoint_artifact(dirfd, items[i].metadata.id) != 0) { result = -1; goto done; }
+        char metadata_name[CHRONO_CHECKPOINT_ID_MAX + 8];
+        (void)snprintf(metadata_name, sizeof(metadata_name), "%s.meta", items[i].metadata.id);
+        if (unlinkat(dirfd, metadata_name, 0) != 0) { result = -1; goto done; }
+    }
+    result = fsync(dirfd);
+done:
+    if (items != NULL) free(items);
+    if (dirfd >= 0 && close(dirfd) != 0) result = -1;
+    if (flock(lock, LOCK_UN) != 0) result = -1;
+    if (close(lock) != 0) result = -1;
+    if (result != 0) set_error(error, error_size, "checkpoint retention failed; uncertain artifacts were preserved");
     return result;
 }

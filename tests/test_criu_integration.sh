@@ -22,22 +22,23 @@ if [ ! -f "$CHRONO_CRIU_PATH" ] || [ ! -x "$CHRONO_CRIU_PATH" ]; then
     exit 77
 fi
 export CHRONO_CRIU_PATH
+export CHRONO_CRIU_UNPRIVILEGED=1
 
 check_log=$(mktemp "${TMPDIR:-/tmp}/chronoos-criu-check-XXXXXX") || {
     echo "CRIU integration test failed: could not create preflight log" >&2
     exit 1
 }
 set +e
-timeout --signal=TERM --kill-after=5s 20s "$CHRONO_CRIU_PATH" check >"$check_log" 2>&1
+timeout --signal=TERM --kill-after=5s 20s "$CHRONO_CRIU_PATH" check --unprivileged >"$check_log" 2>&1
 check_status=$?
 set -e
 if [ "$check_status" -ne 0 ]; then
-    echo "CRIU integration preflight blocked: criu check exited $check_status" >&2
+    echo "CRIU integration preflight blocked: criu check --unprivileged exited $check_status" >&2
     cat "$check_log" >&2
     echo "preflight log preserved at $check_log" >&2
     exit 77
 fi
-echo "CRIU preflight passed; diagnostic log preserved at $check_log"
+echo "Unprivileged CRIU preflight passed; diagnostic log preserved at $check_log"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/chronoos-criu-integration-XXXXXX") || {
     echo "CRIU integration test failed: could not create isolated test directory" >&2
@@ -58,9 +59,33 @@ restored_start=
 launch_attempted=0
 original_stopped=0
 cleanup_started=0
+scheduler_id=
+scheduler_service_pid=
 proc_start_time() {
     process_pid=$1
     timeout --signal=TERM --kill-after=1s 2s awk '{ sub(/^.*[)] /, ""); if (NF >= 20 && $20 ~ /^[0-9]+$/) print $20; else exit 1; }' "/proc/$process_pid/stat"
+}
+proc_counter() {
+    process_pid=$1
+    process_comm=$(cat "/proc/$process_pid/comm" 2>/dev/null) || return 1
+    case "$process_comm" in c:*) process_counter=${process_comm#c:} ;; *) return 1 ;; esac
+    case "$process_counter" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$process_counter"
+}
+wait_for_counter_advance() {
+    state_before=$1
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        state_now=$(cat "$state_file" 2>/dev/null || echo 0)
+        case "$state_now" in ''|*[!0-9]*) return 1 ;; esac
+        if [ "$state_now" -gt "$state_before" ]; then
+            live_state=$state_now
+            return 0
+        fi
+        sleep 0.2
+        attempt=$((attempt + 1))
+    done
+    return 1
 }
 cleanup_restored() {
     [ -n "$restored_pid" ] || return 0
@@ -139,6 +164,14 @@ cleanup_original() {
 cleanup_all() {
     [ "$cleanup_started" -eq 0 ] || return 0
     cleanup_started=1
+    if [ -n "$scheduler_id" ]; then
+        timeout --signal=TERM --kill-after=2s 10s "$CHRONO" stop "$scheduler_id" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$scheduler_service_pid" ] && kill -0 "$scheduler_service_pid" 2>/dev/null; then
+        timeout --signal=TERM --kill-after=2s 10s "$CHRONO" supervisor shutdown >/dev/null 2>&1 || true
+        wait "$scheduler_service_pid" 2>/dev/null || true
+        scheduler_service_pid=
+    fi
     cleanup_original || true
     cleanup_restored || true
 }
@@ -192,6 +225,28 @@ start=$_decimal_normalized
 sleep 2
 [ -s "$state_file" ] || fail "counter did not write its observable state"
 before=$(cat "$state_file")
+before_comm=$(proc_counter "$pid") || fail "counter value was not published in the managed process comm field"
+initial_memory_output=$(timeout --signal=TERM --kill-after=2s 10s "$CHRONO" counter "$pid" "$start" "$start" 2>>"$log") ||
+    fail "could not query the original counter from workload memory"
+initial_memory=${initial_memory_output#COUNTER: }
+case "$initial_memory" in ''|*[!0-9]*) fail "original in-memory counter query returned malformed data" ;; esac
+live_checkpoint_one="live-one-$$"
+live_checkpoint_two="live-two-$$"
+timeout --signal=TERM --kill-after=5s 120s "$CHRONO" checkpoint "$pid" "$start" "$live_checkpoint_one" --leave-running >>"$log" 2>&1 || fail "first leave-running checkpoint failed or timed out"
+timeout --signal=TERM --kill-after=2s 10s "$CHRONO" status "$pid" "$start" >/dev/null 2>&1 ||
+    fail "workload identity was not live after first leave-running dump"
+wait_for_counter_advance "$before" || fail "workload did not continue after first leave-running dump"
+before=$live_state
+timeout --signal=TERM --kill-after=5s 120s "$CHRONO" checkpoint "$pid" "$start" "$live_checkpoint_two" --leave-running >>"$log" 2>&1 || fail "second leave-running checkpoint failed or timed out"
+timeout --signal=TERM --kill-after=2s 10s "$CHRONO" status "$pid" "$start" >/dev/null 2>&1 ||
+    fail "workload identity was not live after second leave-running dump"
+wait_for_counter_advance "$before" || fail "workload did not continue after second leave-running dump"
+before=$live_state
+before_memory_output=$(timeout --signal=TERM --kill-after=2s 10s "$CHRONO" counter "$pid" "$start" "$start" 2>>"$log") ||
+    fail "could not query the checkpoint-time in-memory counter"
+before_memory=${before_memory_output#COUNTER: }
+case "$before_memory" in ''|*[!0-9]*) fail "checkpoint-time in-memory counter query returned malformed data" ;; esac
+[ "$before_memory" -gt 0 ] || fail "checkpoint-time in-memory counter baseline must be nonzero"
 timeout --signal=TERM --kill-after=5s 120s "$CHRONO" checkpoint "$pid" "$start" "$checkpoint_id" >>"$log" 2>&1 || fail "ChronoOS checkpoint failed or timed out"
 if timeout --signal=TERM --kill-after=2s 10s "$CHRONO" status "$pid" "$start" >/dev/null 2>&1; then
     fail "original test process is still reported running after dump"
@@ -241,11 +296,97 @@ while [ "$attempt" -lt 15 ]; do
     attempt=$((attempt + 1))
 done
 [ "$after" -gt "$before" ] || fail "restored counter state did not advance from $before (last value $after)"
+restored_counter=
+attempt=0
+while [ "$attempt" -lt 12 ]; do
+    memory_output=$(timeout --signal=TERM --kill-after=2s 10s "$CHRONO" counter \
+        "$restored_pid" "$restored_start" "$start" 2>>"$log" || true)
+    case "$memory_output" in
+        'COUNTER: '*) restored_counter=${memory_output#COUNTER: } ;;
+        *) restored_counter= ;;
+    esac
+    case "$restored_counter" in ''|*[!0-9]*) ;;
+        *) [ "$restored_counter" -gt "$before_memory" ] && break ;;
+    esac
+    sleep 0.25
+    attempt=$((attempt + 1))
+done
+case "$restored_counter" in ''|*[!0-9]*) fail "restored in-memory counter query returned malformed data" ;; esac
+[ "$restored_counter" -gt "$before_memory" ] ||
+    fail "restored process memory counter did not continue from $before_memory (last $restored_counter)"
+first_restored_memory=$restored_counter
+restored_counter_next=
+attempt=0
+while [ "$attempt" -lt 12 ]; do
+    memory_output=$(timeout --signal=TERM --kill-after=2s 10s "$CHRONO" counter \
+        "$restored_pid" "$restored_start" "$start" 2>>"$log" || true)
+    case "$memory_output" in
+        'COUNTER: '*) restored_counter_next=${memory_output#COUNTER: } ;;
+        *) restored_counter_next= ;;
+    esac
+    case "$restored_counter_next" in ''|*[!0-9]*) ;;
+        *) [ "$restored_counter_next" -gt "$first_restored_memory" ] && break ;;
+    esac
+    sleep 0.25
+    attempt=$((attempt + 1))
+done
+[ -n "$restored_counter_next" ] && [ "$restored_counter_next" -gt "$first_restored_memory" ] ||
+    fail "restored in-memory counter did not advance a second time from $first_restored_memory"
+listing_after_restore=$(timeout --signal=TERM --kill-after=5s 20s "$CHRONO" checkpoints 2>>"$log") ||
+    fail "could not recheck checkpoint metadata after restore"
+printf '%s\n' "$listing_after_restore" |
+    grep -F "$checkpoint_id METADATA_STATE=COMPLETE ARTIFACT=valid " >/dev/null ||
+    fail "restored CRIU sidecar files made the checkpoint artifacts appear invalid"
 verified_restored_pid=$restored_pid
 cleanup_started=1
 cleanup_restored || fail "could not confirm safe cleanup of restored process PID $verified_restored_pid"
 restored_pid=
-echo "CRIU integration test passed: checkpoint artifacts and metadata are valid; identified restored PID $verified_restored_pid ran the expected executable, and its counter state advanced from $before to $after after the original was confirmed stopped"
+cleanup_started=0
+unset CHRONO_TEST_STATE_FILE
+export XDG_STATE_HOME="$test_dir/state"
+"$CHRONO" protect --counter --checkpoint-interval 1 >"$test_dir/scheduler-protect.log" 2>&1 ||
+    fail "could not register the periodic-checkpoint workload"
+scheduler_id=$(awk '/^ChronoOS Process ID:/ {print $4}' "$test_dir/scheduler-protect.log")
+[ -n "$scheduler_id" ] || fail "periodic workload registration returned no ChronoOS ID"
+"$CHRONO" supervisor run >>"$log" 2>&1 &
+scheduler_service_pid=$!
+attempt=0
+while [ ! -S "$XDG_STATE_HOME/chronoos/.supervisor.sock" ] && [ "$attempt" -lt 50 ]; do
+    kill -0 "$scheduler_service_pid" 2>/dev/null || fail "periodic supervisor exited during startup"
+    sleep 0.1
+    attempt=$((attempt + 1))
+done
+[ -S "$XDG_STATE_HOME/chronoos/.supervisor.sock" ] || fail "periodic supervisor socket did not become ready"
+attempt=0
+scheduler_count=0
+while [ "$attempt" -lt 100 ]; do
+    scheduler_count=0
+    for metadata in "$CHRONO_CHECKPOINT_DIR"/*.meta; do
+        [ -f "$metadata" ] || continue
+        if grep -q '^COMPLETE$' "$metadata" 2>/dev/null &&
+           grep -q "^$scheduler_id$" "$metadata" 2>/dev/null; then
+            scheduler_count=$((scheduler_count + 1))
+        fi
+    done
+    [ "$scheduler_count" -ge 2 ] && break
+    kill -0 "$scheduler_service_pid" 2>/dev/null || fail "periodic supervisor exited before two checkpoints"
+    sleep 0.2
+    attempt=$((attempt + 1))
+done
+[ "$scheduler_count" -ge 2 ] || fail "real supervisor did not create two periodic CRIU checkpoints"
+timeout --signal=TERM --kill-after=2s 10s "$CHRONO" status "$scheduler_id" >"$test_dir/scheduler-status.log" 2>&1 ||
+    fail "periodically checkpointed workload is not verifiably running"
+grep -Fx 'State: RUNNING' "$test_dir/scheduler-status.log" >/dev/null ||
+    fail "periodic workload did not remain RUNNING after CRIU dumps"
+timeout --signal=TERM --kill-after=2s 10s "$CHRONO" supervisor shutdown >/dev/null 2>&1 ||
+    fail "periodic supervisor did not accept shutdown"
+wait "$scheduler_service_pid" || fail "periodic supervisor shutdown failed"
+scheduler_service_pid=
+timeout --signal=TERM --kill-after=2s 10s "$CHRONO" stop "$scheduler_id" >/dev/null 2>&1 ||
+    fail "could not safely stop periodic test workload"
+scheduler_id=
+echo "CRIU integration test passed: original PID $pid STARTTIME $start was absent before restore; restored PID $verified_restored_pid STARTTIME $restored_start UID $restored_uid executable $restored_exe; in-memory counter advanced from $before_memory through $first_restored_memory to $restored_counter_next (comm display $before_comm; observable state $before to $after); periodic supervisor published $scheduler_count real CRIU checkpoints while keeping its workload RUNNING" |
+    tee -a "$log"
 echo "integration artifacts: $test_dir"
 echo "preflight log: $check_log"
 echo "Remove this directory only after reviewing its contents: $test_dir"

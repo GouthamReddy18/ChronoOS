@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "chrono/process.h"
+#include "chrono/process_control.h"
 #include "process_internal.h"
 
 #include <errno.h>
@@ -17,9 +18,12 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <poll.h>
 #include <sys/file.h>
 #include <sys/random.h>
+#include <stddef.h>
 
 extern char **environ;
 
@@ -28,6 +32,29 @@ static void set_error(char *error, unsigned long size, const char *message)
     if (error != NULL && size > 0) {
         (void)snprintf(error, (size_t)size, "%s", message);
     }
+}
+
+static int child_fds_cloexec(void)
+{
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, UINT_MAX, 1U << 2) == 0) return 0;
+#endif
+    long maximum = sysconf(_SC_OPEN_MAX);
+    if (maximum < 0) return -1;
+    for (int fd = 3; (long)fd < maximum; ++fd) {
+        int flags;
+        do { flags = fcntl(fd, F_GETFD); } while (flags < 0 && errno == EINTR);
+        if (flags < 0) {
+            if (errno == EBADF) continue;
+            return -1;
+        }
+        if ((flags & FD_CLOEXEC) != 0) continue;
+        int result;
+        do { result = fcntl(fd, F_SETFD, flags | FD_CLOEXEC); }
+        while (result < 0 && errno == EINTR);
+        if (result < 0) return -1;
+    }
+    return 0;
 }
 
 static int parse_decimal(const char **cursor, uintmax_t *value)
@@ -109,6 +136,7 @@ int chrono_process_inspect(pid_t pid, chrono_process_info *info,
     int have_uid = 0;
     int have_state = 0;
     int have_pid = 0;
+    int have_parent = 0;
     uint64_t start_before, start_after;
 
     if (pid <= 0 || info == NULL) {
@@ -153,6 +181,16 @@ int chrono_process_inspect(pid_t pid, chrono_process_info *info,
                 reported == (long)pid)
                 have_pid = 1;
             else have_pid = -1;
+        } else if (strncmp(line, "PPid:", 5) == 0) {
+            char *end;
+            errno = 0;
+            long reported = strtol(line + 5, &end, 10);
+            while (isspace((unsigned char)*end)) ++end;
+            if (!have_parent && errno == 0 && end != line + 5 && *end == '\0' &&
+                reported >= 0 && reported <= INT_MAX) {
+                info->parent_pid = (pid_t)reported;
+                have_parent = 1;
+            } else have_parent = -1;
         } else if (strncmp(line, "Uid:", 4) == 0) {
             if (!have_uid && chrono_parse_uid_line(line + 4, &info->owner) == 0) have_uid = 1;
             else have_uid = -1;
@@ -170,7 +208,7 @@ int chrono_process_inspect(pid_t pid, chrono_process_info *info,
         set_error(error, error_size, "error reading process metadata");
         return -1;
     }
-    if (!have_pid || !have_uid || !have_state) {
+    if (!have_pid || !have_uid || !have_state || !have_parent) {
         set_error(error, error_size, "invalid or incomplete process metadata in /proc");
         return -1;
     }
@@ -204,6 +242,16 @@ int chrono_process_inspect(pid_t pid, chrono_process_info *info,
     if (used == 0) {
         (void)snprintf(info->command, sizeof(info->command), "[kernel or unavailable]");
     }
+    (void)snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+    ssize_t executable_length = readlink(path, info->executable, sizeof(info->executable) - 1);
+    struct stat executable_stat;
+    if (executable_length >= 0 && (size_t)executable_length < sizeof(info->executable) - 1 &&
+        stat(path, &executable_stat) == 0) {
+        info->executable[executable_length] = '\0';
+        info->executable_device = executable_stat.st_dev;
+        info->executable_inode = executable_stat.st_ino;
+    }
+    info->start_time = start_before;
     if (read_start_time(pid, &start_after) != 0 || start_before != start_after) {
         set_error(error, error_size, "process exited or changed identity during inspection");
         return -1;
@@ -401,7 +449,7 @@ int chrono_managed_start(const char *counter_path, long interval, pid_t *pid,
                          uint64_t *start_time, char *error, unsigned long error_size)
 {
     int pipefd[2], workload_fd;
-    struct stat workload_stat;
+    struct stat workload_stat, launcher_stat;
     unsigned char random_token[16];
     char token[33];
     if (counter_path == NULL || pid == NULL || start_time == NULL || interval < 1 || interval > 60) {
@@ -412,6 +460,11 @@ int chrono_managed_start(const char *counter_path, long interval, pid_t *pid,
         workload_stat.st_uid != getuid() || (workload_stat.st_mode & 0111) == 0) {
         if (workload_fd >= 0) close(workload_fd);
         set_error(error, error_size, "bundled counter executable could not be validated"); return -1;
+    }
+    if (stat("/proc/self/exe", &launcher_stat) != 0 || !S_ISREG(launcher_stat.st_mode)) {
+        close(workload_fd);
+        set_error(error, error_size, "cannot establish ChronoOS executable identity");
+        return -1;
     }
     size_t random_used = 0;
     while (random_used < sizeof(random_token)) {
@@ -432,8 +485,20 @@ int chrono_managed_start(const char *counter_path, long interval, pid_t *pid,
         if (nullfd < 0) { int e = errno; ssize_t ignored = write(pipefd[1], &e, sizeof(e)); (void)ignored; _exit(127); }
         (void)dup2(nullfd, STDIN_FILENO); (void)dup2(nullfd, STDOUT_FILENO); (void)dup2(nullfd, STDERR_FILENO);
         if (nullfd > STDERR_FILENO) close(nullfd);
-        char interval_arg[16]; (void)snprintf(interval_arg, sizeof(interval_arg), "%ld", interval);
-        char *const args[] = {(char *)"counter_workload", interval_arg, token, NULL};
+        if (child_fds_cloexec() != 0) {
+            int e = errno;
+            ssize_t ignored = write(pipefd[1], &e, sizeof(e));
+            (void)ignored;
+            _exit(127);
+        }
+        char interval_arg[16], launcher_device[32], launcher_inode[32];
+        (void)snprintf(interval_arg, sizeof(interval_arg), "%ld", interval);
+        (void)snprintf(launcher_device, sizeof(launcher_device), "%llu",
+                       (unsigned long long)launcher_stat.st_dev);
+        (void)snprintf(launcher_inode, sizeof(launcher_inode), "%llu",
+                       (unsigned long long)launcher_stat.st_ino);
+        char *const args[] = {(char *)"counter_workload", interval_arg, token,
+                              launcher_device, launcher_inode, NULL};
         /* Execute the already validated open inode, avoiding a path replacement race. */
         fexecve(workload_fd, args, environ);
         int e = errno; ssize_t ignored = write(pipefd[1], &e, sizeof(e)); (void)ignored; _exit(127);
@@ -464,6 +529,36 @@ int chrono_managed_start(const char *counter_path, long interval, pid_t *pid,
     (void)kill(child, SIGTERM);
     (void)waitpid(child, NULL, 0);
     set_error(error, error_size, "launched counter exited or identity could not be read"); return -1;
+}
+
+int chrono_managed_start_bundled(long interval, pid_t *pid, uint64_t *start_time,
+                                 char *error, unsigned long error_size)
+{
+    char self[PATH_MAX], counter[PATH_MAX];
+    ssize_t length = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (length < 0 || (size_t)length >= sizeof(self) - 1) {
+        set_error(error, error_size, "cannot resolve ChronoOS executable");
+        return -1;
+    }
+    self[length] = '\0';
+    char *slash = strrchr(self, '/');
+    if (slash == NULL) {
+        set_error(error, error_size, "invalid resolved executable path");
+        return -1;
+    }
+    *slash = '\0';
+    int n = snprintf(counter, sizeof(counter), "%s/counter_workload", self);
+    if (n < 0 || (size_t)n >= sizeof(counter)) {
+        set_error(error, error_size, "workload path too long");
+        return -1;
+    }
+    struct stat workload;
+    if (lstat(counter, &workload) != 0 || !S_ISREG(workload.st_mode) ||
+        workload.st_uid != getuid() || (workload.st_mode & 0111) == 0) {
+        set_error(error, error_size, "bundled counter workload is missing or invalid");
+        return -1;
+    }
+    return chrono_managed_start(counter, interval, pid, start_time, error, error_size);
 }
 
 static int verify_managed(pid_t pid, uint64_t start_time, int pidfd, char *error, unsigned long size)
@@ -550,6 +645,251 @@ int chrono_managed_pin(pid_t pid, uint64_t start_time, char *error, unsigned lon
 #else
     (void)pid; (void)start_time;
     set_error(error, size, "pidfd unavailable; cannot pin managed process identity");
+    return -1;
+#endif
+}
+
+int chrono_managed_control_endpoint(pid_t pid, uint64_t start_time, char *name,
+                                    size_t name_size, char *error,
+                                    unsigned long error_size)
+{
+    if (name == NULL || name_size == 0 || pid <= 1 || start_time == 0) {
+        set_error(error, error_size, "invalid managed control-channel identity");
+        return -1;
+    }
+    int pidfd = chrono_managed_pin(pid, start_time, error, error_size);
+    if (pidfd < 0) return -1;
+    char token[33];
+    struct stat executable;
+    int registry_result = registry_file(pid, start_time, &executable, NULL, 0, token);
+    close(pidfd);
+    if (registry_result != 0 ||
+        chrono_control_name(getuid(), pid, start_time, token, name, name_size) != 0) {
+        set_error(error, error_size, "cannot derive a verified managed control endpoint");
+        return -1;
+    }
+    return 0;
+}
+
+int chrono_managed_counter_query(pid_t pid, uint64_t current_start_time,
+                                 uint64_t checkpoint_start_time,
+                                 unsigned long long *counter,
+                                 char *error, unsigned long error_size)
+{
+#if defined(SYS_pidfd_open)
+    if (pid <= 1 || current_start_time == 0 || checkpoint_start_time == 0 || counter == NULL) {
+        set_error(error, error_size, "invalid managed counter query identity");
+        return -1;
+    }
+    int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    if (pidfd < 0) {
+        set_error(error, error_size, "pidfd unavailable; cannot pin managed counter identity");
+        return -1;
+    }
+    if (fcntl(pidfd, F_SETFD, FD_CLOEXEC) != 0) {
+        close(pidfd);
+        set_error(error, error_size, "cannot secure managed counter pidfd");
+        return -1;
+    }
+
+    chrono_process_info before;
+    struct pollfd pinned = {.fd = pidfd, .events = POLLIN};
+    if (chrono_process_inspect(pid, &before, error, error_size) != 0 ||
+        before.start_time != current_start_time || before.owner != getuid() ||
+        before.executable_inode == 0 ||
+        poll(&pinned, 1, 0) != 0) {
+        close(pidfd);
+        set_error(error, error_size, "managed counter process identity is not live and verified");
+        return -1;
+    }
+
+    char command_path[64], command_line[CHRONO_COMMAND_MAX];
+    (void)snprintf(command_path, sizeof(command_path), "/proc/%ld/cmdline", (long)pid);
+    int command_fd = open(command_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (command_fd < 0) {
+        close(pidfd);
+        set_error(error, error_size, "cannot inspect managed counter launch token");
+        return -1;
+    }
+    ssize_t command_length;
+    do { command_length = read(command_fd, command_line, sizeof(command_line) - 1); }
+    while (command_length < 0 && errno == EINTR);
+    int command_close = close(command_fd);
+    if (command_length <= 0 || command_length >= (ssize_t)sizeof(command_line) - 1 || command_close != 0) {
+        close(pidfd);
+        set_error(error, error_size, "managed counter launch command is unreadable or oversized");
+        return -1;
+    }
+    command_line[command_length] = '\0';
+    char *argument = command_line;
+    size_t remaining = (size_t)command_length;
+    for (unsigned index = 0; index < 3; ++index) {
+        char *terminator = memchr(argument, '\0', remaining);
+        if (terminator == NULL) {
+            close(pidfd);
+            set_error(error, error_size, "managed counter command does not contain its launch token");
+            return -1;
+        }
+        if (index == 0) {
+            char *base = strrchr(argument, '/');
+            base = base == NULL ? argument : base + 1;
+            if (strcmp(base, "counter_workload") != 0) {
+                close(pidfd);
+                set_error(error, error_size, "process is not the ChronoOS counter workload");
+                return -1;
+            }
+        }
+        if (index == 2) {
+            size_t token_length = (size_t)(terminator - argument);
+            if (token_length != 32) {
+                close(pidfd);
+                set_error(error, error_size, "managed counter launch token is invalid");
+                return -1;
+            }
+            char token[33];
+            memcpy(token, argument, token_length);
+            token[token_length] = '\0';
+            if (is_counter(pid, token) != 1) {
+                close(pidfd);
+                set_error(error, error_size, "managed counter launch token did not verify");
+                return -1;
+            }
+            break;
+        }
+        size_t consumed = (size_t)(terminator - argument) + 1;
+        argument = terminator + 1;
+        remaining -= consumed;
+    }
+
+    char endpoint[CHRONO_CONTROL_NAME_MAX];
+    char token[33];
+    memcpy(token, argument, 32);
+    token[32] = '\0';
+    if (chrono_control_name(getuid(), pid, checkpoint_start_time, token,
+                            endpoint, sizeof(endpoint)) != 0) {
+        close(pidfd);
+        set_error(error, error_size, "cannot derive managed counter control endpoint");
+        return -1;
+    }
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    size_t name_length = strlen(endpoint);
+    if (name_length + 1 > sizeof(address.sun_path)) {
+        close(pidfd);
+        set_error(error, error_size, "managed counter control endpoint is too long");
+        return -1;
+    }
+    address.sun_path[0] = '\0';
+    memcpy(address.sun_path + 1, endpoint, name_length);
+    socklen_t address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_length);
+    int channel = -1;
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        channel = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (channel < 0) break;
+        if (connect(channel, (struct sockaddr *)&address, address_length) == 0) break;
+        int saved = errno;
+        close(channel);
+        channel = -1;
+        if (saved != ECONNREFUSED && saved != ENOENT && saved != EINTR) {
+            errno = saved;
+            break;
+        }
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000000};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
+    }
+    if (channel < 0) {
+        close(pidfd);
+        set_error(error, error_size, "managed workload counter query channel is unavailable");
+        return -1;
+    }
+    chrono_control_request request = {
+        .magic = CHRONO_CONTROL_MAGIC,
+        .version = CHRONO_CONTROL_VERSION,
+        .operation = CHRONO_CONTROL_QUERY_COUNTER,
+        .target_pid = (int32_t)pid,
+        .reserved = 0,
+        .target_start_time = checkpoint_start_time
+    };
+    ssize_t sent;
+    do { sent = send(channel, &request, sizeof(request), MSG_NOSIGNAL); }
+    while (sent < 0 && errno == EINTR);
+    chrono_control_response response = {0};
+    ssize_t received = sent == (ssize_t)sizeof(request) ?
+                       recv(channel, &response, sizeof(response), 0) : -1;
+    int saved = errno;
+    struct ucred peer_credentials;
+    socklen_t peer_credentials_size = sizeof(peer_credentials);
+    int peer_verified = getsockopt(channel, SOL_SOCKET, SO_PEERCRED, &peer_credentials,
+                                   &peer_credentials_size) == 0 &&
+                        peer_credentials_size == sizeof(peer_credentials) &&
+                        peer_credentials.pid == pid && peer_credentials.uid == getuid();
+    (void)close(channel);
+    int result = -1;
+    if (received == (ssize_t)sizeof(response) && response.magic == CHRONO_CONTROL_MAGIC &&
+        response.reserved == 0 && response.status == 0 && response.error_number == 0 && peer_verified) {
+        chrono_process_info after;
+        if (chrono_process_inspect(pid, &after, error, error_size) == 0 &&
+            after.start_time == current_start_time && after.owner == getuid() &&
+            after.executable_device == before.executable_device &&
+            after.executable_inode == before.executable_inode &&
+            strcmp(after.command, before.command) == 0 && poll(&pinned, 1, 0) == 0) {
+            *counter = response.value;
+            result = 0;
+        } else {
+            set_error(error, error_size, "managed counter process identity changed during query");
+        }
+    } else {
+        if (received == (ssize_t)sizeof(response) && response.error_number > 0)
+            saved = response.error_number;
+        char message[160];
+        (void)snprintf(message, sizeof(message), "managed in-memory counter query failed: %s",
+                       strerror(saved != 0 ? saved : peer_verified ? EPROTO : EPERM));
+        set_error(error, error_size, message);
+    }
+    close(pidfd);
+    return result;
+#else
+    (void)pid; (void)current_start_time; (void)checkpoint_start_time; (void)counter;
+    set_error(error, error_size, "pidfd unavailable; cannot verify managed counter identity");
+    return -1;
+#endif
+}
+
+int chrono_process_stop_verified(pid_t pid, uint64_t start_time, dev_t executable_device,
+                                 ino_t executable_inode, const char *expected_command,
+                                 char *error, unsigned long size)
+{
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    if (pid <= 1 || start_time == 0 || executable_inode == 0 || expected_command == NULL) {
+        set_error(error, size, "invalid process identity; refusing to signal");
+        return -1;
+    }
+    int fd = (int)syscall(SYS_pidfd_open, pid, 0);
+    if (fd < 0) {
+        set_error(error, size, "pidfd unavailable; refusing race-prone signal");
+        return -1;
+    }
+    chrono_process_info info;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    if (chrono_process_inspect(pid, &info, error, size) != 0 ||
+        info.start_time != start_time || info.owner != getuid() ||
+        info.executable_device != executable_device || info.executable_inode != executable_inode ||
+        strcmp(info.command, expected_command) != 0 || poll(&pfd, 1, 0) != 0) {
+        close(fd);
+        set_error(error, size, "process identity changed; no signal sent");
+        return -1;
+    }
+    int result = (int)syscall(SYS_pidfd_send_signal, fd, SIGTERM, NULL, 0);
+    int saved = errno;
+    close(fd);
+    if (result != 0) {
+        errno = saved;
+        set_error(error, size, "cannot signal verified restored process");
+        return -1;
+    }
+    return 0;
+#else
+    (void)pid; (void)start_time; (void)executable_device; (void)executable_inode; (void)expected_command;
+    set_error(error, size, "pidfd signaling unavailable; refusing to signal");
     return -1;
 #endif
 }

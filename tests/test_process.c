@@ -34,11 +34,13 @@ int main(void)
     }
     if (chrono_process_inspect(child, &info, error, sizeof(error)) != 0 ||
         info.pid != child || info.owner != getuid() || info.state == '\0' ||
-        info.command[0] == '\0') {
+        info.parent_pid != getpid() || info.start_time == 0 || info.executable[0] == '\0' ||
+        info.executable_inode == 0 || info.command[0] == '\0') {
         (void)kill(child, SIGTERM);
         (void)waitpid(child, NULL, 0);
         return fail("valid child inspection failed");
     }
+    chrono_process_info child_info = info;
     if (chrono_process_inspect(getpid(), &info, error, sizeof(error)) == 0 ||
         strstr(error, "itself") == NULL) {
         (void)kill(child, SIGTERM);
@@ -55,7 +57,29 @@ int main(void)
         (void)waitpid(child, NULL, 0);
         return fail("nonexistent PID was accepted");
     }
-    (void)kill(child, SIGTERM);
+    if (chrono_process_stop_verified(child, child_info.start_time + 1,
+                                     child_info.executable_device, child_info.executable_inode,
+                                     child_info.command,
+                                     error, sizeof(error)) == 0 || kill(child, 0) != 0) {
+        (void)kill(child, SIGTERM);
+        (void)waitpid(child, NULL, 0);
+        return fail("mismatched restored identity was signaled");
+    }
+    if (chrono_process_stop_verified(child, child_info.start_time,
+                                     child_info.executable_device, child_info.executable_inode + 1,
+                                     child_info.command,
+                                     error, sizeof(error)) == 0 || kill(child, 0) != 0) {
+        (void)kill(child, SIGTERM);
+        (void)waitpid(child, NULL, 0);
+        return fail("mismatched executable identity was signaled");
+    }
+    if (chrono_process_stop_verified(child, child_info.start_time, child_info.executable_device,
+                                     child_info.executable_inode, child_info.command,
+                                     error, sizeof(error)) != 0) {
+        (void)kill(child, SIGTERM);
+        (void)waitpid(child, NULL, 0);
+        return fail("verified process stop failed");
+    }
     if (waitpid(child, NULL, 0) != child) return fail("waitpid failed");
     if (chrono_process_inspect(child, &info, error, sizeof(error)) == 0) {
         return fail("exited process was accepted");

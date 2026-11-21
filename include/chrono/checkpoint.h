@@ -7,6 +7,7 @@
 
 #define CHRONO_CHECKPOINT_ID_MAX 64
 #define CHRONO_CHECKPOINT_TEXT_MAX 256
+#define CHRONO_CHECKPOINT_RETENTION_DEFAULT 3U
 
 typedef enum {
     CHRONO_CHECKPOINT_PREPARING,
@@ -37,6 +38,7 @@ typedef struct {
     const char *name;
     int available;
     int (*checkpoint)(const chrono_checkpoint_metadata *, const char *, char *, size_t);
+    int (*checkpoint_live)(const chrono_checkpoint_metadata *, const char *, char *, size_t);
     int (*restore)(const chrono_checkpoint_metadata *, const char *, pid_t *, char *, size_t);
 } chrono_checkpoint_backend;
 
@@ -57,10 +59,20 @@ int chrono_checkpoint_read(const char *directory, const char *id,
                            char *error, size_t error_size);
 /*
  * Checks the adapter's private flat image-file layout and inventory presence,
- * not image integrity or compatibility with a particular CRIU version. The
- * flat-layout assumption is based on the --images-dir interface used here and
- * has not been verified against real CRIU in this project.
+ * allowing CRIU's regular stats-dump sidecar. This is structural validation,
+ * not image integrity or compatibility verification.
  */
 int chrono_checkpoint_artifact_valid(const char *directory, const char *id);
+/* A shared use lock protects a checkpoint restore; exclusive mode is used by
+ * latest-reference publication and retention. Returned fd owns the lock. */
+int chrono_checkpoint_use_lock(const char *directory, int exclusive,
+                               char *error, size_t error_size);
+int chrono_checkpoint_publish_latest(const char *directory, const char *workload,
+                                     const char *id, char *error, size_t error_size);
+int chrono_checkpoint_latest(const char *directory, const char *workload,
+                             chrono_checkpoint_metadata *metadata,
+                             char *error, size_t error_size);
+int chrono_checkpoint_retain(const char *directory, const char *workload,
+                             size_t maximum, char *error, size_t error_size);
 
 #endif

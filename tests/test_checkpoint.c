@@ -7,15 +7,33 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <errno.h>
 
 static int listed;
 static char test_dir[128];
+static void remove_artifact(const char *id)
+{
+    static const char *const files[] = {
+        "inventory.img", "core-1.img", "stats-dump", "stats-restore"
+    };
+    char directory[256], path[512];
+    (void)snprintf(directory, sizeof(directory), "%s/%s", test_dir, id);
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
+        (void)snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+        (void)unlink(path);
+    }
+    (void)rmdir(directory);
+}
+
 static void cleanup(void)
 {
+    remove_artifact("cp-a"); remove_artifact("cp-b");
+    remove_artifact("cp-c"); remove_artifact("cp-d");
     DIR *d=opendir(test_dir);
     if(d!=NULL) {
         struct dirent *e;
@@ -27,6 +45,30 @@ static void cleanup(void)
         closedir(d);
     }
     (void)rmdir(test_dir);
+}
+
+static int create_complete_fixture(const char *id, const char *workload)
+{
+    chrono_checkpoint_metadata metadata = {0};
+    (void)snprintf(metadata.id, sizeof(metadata.id), "%s", id);
+    metadata.original_pid = getpid(); metadata.process_start_time = 99;
+    (void)snprintf(metadata.workload, sizeof(metadata.workload), "%s", workload);
+    (void)snprintf(metadata.executable, sizeof(metadata.executable), "/test/counter");
+    (void)snprintf(metadata.backend, sizeof(metadata.backend), "criu");
+    metadata.state = CHRONO_CHECKPOINT_PREPARING;
+    char error[256];
+    if (chrono_checkpoint_begin(test_dir, &metadata, error, sizeof(error)) != 0) return -1;
+    char directory[256], path[512];
+    (void)snprintf(directory, sizeof(directory), "%s/%s", test_dir, id);
+    if (mkdir(directory, 0700) != 0) return -1;
+    const char *files[] = {"inventory.img", "core-1.img", "stats-restore"};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
+        (void)snprintf(path, sizeof(path), "%s/%s", directory, files[i]);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 || write(fd, "fixture", 7) != 7 || close(fd) != 0) return -1;
+    }
+    return chrono_checkpoint_transition(test_dir, id, CHRONO_CHECKPOINT_COMPLETE,
+                                        error, sizeof(error));
 }
 static int collect(const chrono_checkpoint_metadata *m, void *context)
 {
@@ -131,6 +173,66 @@ int main(void)
        chrono_checkpoint_transition(test_dir,"finished",CHRONO_CHECKPOINT_COMPLETE,error,sizeof(error))!=0) return fail("complete transition failed");
     if(chrono_checkpoint_transition(test_dir,"finished",CHRONO_CHECKPOINT_FAILED,error,sizeof(error))==0) return fail("terminal state changed");
     if(chrono_checkpoint_list(test_dir,collect,NULL,error,sizeof(error))!=0 || listed!=1) return fail("complete metadata not listed");
+    const char *retained_ids[] = {"cp-a", "cp-b", "cp-c"};
+    for (size_t i = 0; i < sizeof(retained_ids) / sizeof(retained_ids[0]); ++i)
+        if (create_complete_fixture(retained_ids[i], "cp-000001") != 0)
+            return fail("could not create complete retention fixture");
+    for (size_t i = 0; i < sizeof(retained_ids) / sizeof(retained_ids[0]); ++i)
+        if (chrono_checkpoint_publish_latest(test_dir, "cp-000001", retained_ids[i], error, sizeof(error)) != 0)
+            return fail("could not publish a complete checkpoint as latest");
+    if (chrono_checkpoint_publish_latest(test_dir, "cp-000001", "cp-a", error, sizeof(error)) != 0)
+        return fail("publishing an older checkpoint should leave latest unchanged");
+    chrono_checkpoint_metadata latest;
+    if (chrono_checkpoint_latest(test_dir, "cp-000001", &latest, error, sizeof(error)) != 0 ||
+        strcmp(latest.id, "cp-c") != 0) return fail("latest-valid reference did not select the newest checkpoint");
+    strcpy(m.id, "cp-fail"); m.state = CHRONO_CHECKPOINT_PREPARING;
+    strcpy(m.workload, "cp-000001");
+    if (chrono_checkpoint_begin(test_dir, &m, error, sizeof(error)) != 0 ||
+        chrono_checkpoint_transition(test_dir, "cp-fail", CHRONO_CHECKPOINT_FAILED, error, sizeof(error)) != 0 ||
+        chrono_checkpoint_publish_latest(test_dir, "cp-000001", "cp-fail", error, sizeof(error)) == 0 ||
+        chrono_checkpoint_latest(test_dir, "cp-000001", &latest, error, sizeof(error)) != 0 ||
+        strcmp(latest.id, "cp-c") != 0) return fail("failed checkpoint replaced latest-valid reference");
+    char latest_path[256];
+    (void)snprintf(latest_path, sizeof(latest_path), "%s/latest-cp-000001", test_dir);
+    int latest_fd = open(latest_path, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW);
+    if (latest_fd < 0 || write(latest_fd, "invalid\n", 8) != 8 || close(latest_fd) != 0 ||
+        chrono_checkpoint_latest(test_dir, "cp-000001", &latest, error, sizeof(error)) != 0 ||
+        strcmp(latest.id, "cp-c") != 0) return fail("corrupt latest reference was not safely reconstructed");
+    if (create_complete_fixture("cp-d", "cp-000001") != 0 ||
+        chrono_checkpoint_publish_latest(test_dir, "cp-000001", "cp-d", error, sizeof(error)) != 0 ||
+        chrono_checkpoint_retain(test_dir, "cp-000001", 2, error, sizeof(error)) != 0)
+        return fail("checkpoint retention failed");
+    if (!chrono_checkpoint_artifact_valid(test_dir, "cp-c") ||
+        !chrono_checkpoint_artifact_valid(test_dir, "cp-d") ||
+        chrono_checkpoint_read(test_dir, "cp-b", &latest, error, sizeof(error)) == 0)
+        return fail("retention did not preserve latest and enforce the configured limit");
+    int use_lock = chrono_checkpoint_use_lock(test_dir, 0, error, sizeof(error));
+    int ready_pipe[2];
+    if (use_lock < 0 || pipe(ready_pipe) != 0) return fail("could not establish restore-use lock test");
+    pid_t retention_child = fork();
+    if (retention_child == 0) {
+        close(ready_pipe[0]);
+        ssize_t ready_written = write(ready_pipe[1], "r", 1);
+        close(ready_pipe[1]);
+        if (ready_written != 1) _exit(2);
+        _exit(chrono_checkpoint_retain(test_dir, "cp-000001", 1, error, sizeof(error)) == 0 ? 0 : 1);
+    }
+    close(ready_pipe[1]); char ready_byte;
+    if (retention_child < 0 || read(ready_pipe[0], &ready_byte, 1) != 1)
+        return fail("retention synchronization child failed");
+    close(ready_pipe[0]);
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000000};
+    (void)nanosleep(&pause, NULL);
+    int child_status;
+    if (waitpid(retention_child, &child_status, WNOHANG) != 0)
+        return fail("retention did not wait for an active restore-use lock");
+    (void)flock(use_lock, LOCK_UN); close(use_lock);
+    if (waitpid(retention_child, &child_status, 0) != retention_child ||
+        !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
+        return fail("retention did not complete after restore-use lock release");
+    if (!chrono_checkpoint_artifact_valid(test_dir, "cp-d") ||
+        chrono_checkpoint_artifact_valid(test_dir, "cp-c"))
+        return fail("latest checkpoint was not protected during retention");
     if(chrono_checkpoint_begin("/path/that/does/not/exist/chrono",&m,error,sizeof(error))==0) return fail("directory error ignored");
     char record[256]; (void)snprintf(record,sizeof(record),"%s/broken.meta",test_dir);
     int fd=open(record,O_WRONLY|O_CREAT|O_EXCL,0600);
